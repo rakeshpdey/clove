@@ -5,12 +5,25 @@ edition = "2024"
 
 [dependencies]
 bytemuck = "1.25.0"
+memmap2 = "0.9.11"
 ndarray = "0.17.2"
 num-complex = "0.4.6"
 num-traits = "0.2.19"
 num_cpus = "1.17.0"
 pollster = "0.4.0"
-rand = "0.10.1"
+rand = { version = "0.10", features = ["thread_rng"] }
 rand_distr = "0.6.0"
 rayon = "1.12.0"
+safetensors = "0.8.0"
 wgpu = "29.0.3"
+tokenizers = { version = "0.23.1", features = ["http"] }
+tokio = { version = "1.52.3", features = ["full"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2.126"
+web-sys = { version = "0.3", features = ["Window", "Document", "Gpu", "GpuDevice", "GpuAdapter"] }
+js-sys = "0.3.103"
+
+[lib]
+name = "organon"
+crate-type = ["rlib", "cdylib"]

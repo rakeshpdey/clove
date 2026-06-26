@@ -1,13 +1,14 @@
 use crate::nn::Linear;
-use crate::tensor::{Tensor, Node};
+use crate::tensor::{TensorGraph, TensorNode};
+use crate::backend::Backend;
 
-pub struct Expert {
-    pub w1: Linear,
-    pub w2: Linear,
+pub struct Expert<B: Backend> {
+    pub w1: Linear<B>,
+    pub w2: Linear<B>,
     pub dropout_rate: f32,
 }
 
-impl Expert {
+impl<B: Backend> Expert<B> {
     pub fn new(hidden_size: usize, hidden_dim: usize, dropout_rate: f32) -> Self {
         Self {
             w1: Linear::new(hidden_size, hidden_dim),
@@ -16,22 +17,28 @@ impl Expert {
         }
     }
 
-    pub fn forward(&self, x: &Node) -> Node {
+    pub fn forward(&self, x: &TensorNode<B>) -> TensorNode<B> {
         let h1 = self.w1.forward(x);
-        let gelu = Tensor::gelu(&h1);
-        let dropped = Tensor::dropout(&gelu, self.dropout_rate);
+        let gelu = TensorGraph::<B>::gelu(&h1);
+        let dropped = TensorGraph::<B>::dropout(&gelu, self.dropout_rate);
         self.w2.forward(&dropped)
+    }
+    
+    pub fn parameters(&self) -> Vec<TensorNode<B>> {
+        let mut params = self.w1.parameters();
+        params.extend(self.w2.parameters());
+        params
     }
 }
 
-pub struct MoELayer {
+pub struct MoELayer<B: Backend> {
     pub num_experts: usize,
     pub top_k: usize,
-    pub router: Linear,
-    pub experts: Vec<Expert>,
+    pub router: Linear<B>,
+    pub experts: Vec<Expert<B>>,
 }
 
-impl MoELayer {
+impl<B: Backend> MoELayer<B> {
     pub fn new(hidden_size: usize, hidden_dim: usize, num_experts: usize, top_k: usize, dropout_rate: f32) -> Self {
         let mut experts = Vec::new();
         for _ in 0..num_experts {
@@ -41,26 +48,43 @@ impl MoELayer {
         Self {
             num_experts,
             top_k,
-            // The router takes a hidden vector and projects it to a score for each expert
             router: Linear::new(hidden_size, num_experts),
             experts,
         }
     }
 
-    pub fn forward(&self, x: &Node) -> Node {
-        // 1. Compute routing scores across all experts
+    pub fn forward(&self, x: &TensorNode<B>) -> (TensorNode<B>, f32) {
         let routing_logits = self.router.forward(x);
-        let routing_weights = Tensor::softmax(&routing_logits);
+        let routing_weights = TensorGraph::<B>::softmax(&routing_logits);
         
         // =====================================================================
-        // THE VRAM BRIDGE: Safely extract probabilities from GPU VRAM to RAM!
+        // WARNING: THE XLA TRAP!
         // =====================================================================
+        // This `to_cpu()` call forces a sync with physical memory.
+        // If you use LazyBackend (XLA), this will panic because the graph hasn't executed yet!
+        // To make MoE XLA-compatible, you would need to implement a WGSL TopK shader 
+        // so the routing happens entirely on the GPU without CPU intervention.
         let probs_matrix = routing_weights.read().unwrap().to_cpu();
+
+        let mut avg_probs = vec![0.0; self.num_experts];
+        let batch_size = probs_matrix.shape()[0] as f32;
+
+        for i in 0..self.num_experts {
+            let mut sum = 0.0;
+            for b in 0..probs_matrix.shape()[0] {
+                sum += probs_matrix[[b, i]];
+            }
+            avg_probs[i] = sum / batch_size;
+        }
+        
+        let target_prob = 1.0 / self.num_experts as f32;
+        let penalty: f32 = avg_probs.iter()
+            .map(|&p| (p - target_prob).powi(2))
+            .sum::<f32>() * 0.1;
         
         let mut best_expert_idx = 0;
         let mut max_val = f32::NEG_INFINITY;
         
-        // Evaluate the first row (assuming a sequence/batch size of 1 for the demo)
         for i in 0..self.num_experts {
             let val = probs_matrix[[0, i]];
             if val > max_val {
@@ -69,11 +93,7 @@ impl MoELayer {
             }
         }
         
-        // 2. Route the input dynamically to the chosen expert
         let expert_output = self.experts[best_expert_idx].forward(x);
-        
-        // 3. Weight the output by the router's confidence score
-        // We use our new `mul_scalar` helper to avoid allocating a tiny new tensor!
-        Tensor::mul_scalar(&expert_output, max_val)
+        (TensorGraph::<B>::mul_scalar(&expert_output, max_val), penalty)
     }
 }

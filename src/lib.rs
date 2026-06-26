@@ -1,31 +1,31 @@
-// run cargo test after compiling & correct order
-
+pub mod backend;
 pub mod tensor;
 pub mod nn;
 pub mod optim;
 pub mod device;
-// pub mod complex_tensor;
+pub mod data;
+pub mod lazy;
+pub mod distributed;
+pub mod ffi;
 
 pub use device::EngineDevice;
 pub use tensor::{Tensor, Node};
-pub use optim::SGD;
+pub use optim::AdamW;
 
 #[cfg(test)]
 mod tests {
     use super::nn::Linear;
-    use super::optim::SGD;
+    use super::optim::AdamW; // UPGRADED: Replaced SGD with AdamW!
     use super::tensor::{Tensor, Node};
-    // use super::complex_tensor::ComplexTensor;
-    // use num_complex::Complex32;
     use ndarray::{array, Array2};
-    use std::sync::Arc; // UPGRADED: Replaced Rc with Arc
+    use std::sync::Arc;
 
     // =========================================================
     // TEST HELPERS: Bridging Arc<RwLock> back to ndarray 
     // =========================================================
     fn to_arr(node: &Node) -> Array2<f32> {
         let t = node.read().unwrap();
-        if let crate::tensor::TensorData::Cpu(ref vec) = t.data {
+        if let crate::backend::TensorData::Cpu(ref vec) = t.data {
             Array2::from_shape_vec((t.shape[0], t.shape[1]), vec.clone()).expect("Shape mismatch")
         } else {
             panic!("Test Failed: Cannot extract ndarray from GPU Tensor.");
@@ -135,7 +135,7 @@ mod tests {
         let layer = Linear::new(2, 1);
 
         let params = vec![Arc::clone(&layer.weights), Arc::clone(&layer.bias)];
-        let optimizer = SGD::new(0.05, params);
+        let mut optimizer = AdamW::new(0.05, params); // UPGRADED
 
         println!("Initial random prediction: {}", to_arr(&layer.forward(&input_x)));
 
@@ -191,7 +191,7 @@ mod tests {
         params.push(Arc::clone(&layer2.weights)); params.push(Arc::clone(&layer2.bias));
         params.push(Arc::clone(&layer3.weights)); params.push(Arc::clone(&layer3.bias));
 
-        let optimizer = SGD::new(0.1, params);
+        let mut optimizer = AdamW::new(0.1, params); // UPGRADED
 
         println!("Training Deep Network for 2,000 Epochs...");
 
@@ -255,7 +255,7 @@ mod tests {
         params.push(Arc::clone(&layer1.weights)); params.push(Arc::clone(&layer1.bias));
         params.push(Arc::clone(&layer2.weights)); params.push(Arc::clone(&layer2.bias));
 
-        let optimizer = SGD::new(0.05, params);
+        let mut optimizer = AdamW::new(0.05, params); // UPGRADED
 
         println!("Training Classifier for 500 Epochs...");
 
@@ -317,7 +317,7 @@ mod tests {
         ];
 
         let params = vec![Arc::clone(&kernel)];
-        let optimizer = SGD::new(0.05, params);
+        let mut optimizer = AdamW::new(0.05, params); // UPGRADED
 
         println!("Training Convolutional Kernel for 300 Epochs...");
 
@@ -384,7 +384,7 @@ mod tests {
         params.push(Arc::clone(&layer1.weights)); params.push(Arc::clone(&layer1.bias));
         params.push(Arc::clone(&layer2.weights)); params.push(Arc::clone(&layer2.bias));
 
-        let optimizer = SGD::new(0.01, params);
+        let mut optimizer = AdamW::new(0.01, params); // UPGRADED
 
         println!("Training Physics Engine for 2,000 Epochs...");
 
@@ -455,7 +455,7 @@ mod tests {
             let grad = grad_to_arr(&x_sgd);
             
             // Adjust weights via safe inner lock traversal
-            if let crate::tensor::TensorData::Cpu(ref mut d) = x_sgd.write().unwrap().data {
+            if let crate::backend::TensorData::Cpu(ref mut d) = x_sgd.write().unwrap().data {
                 d[0] -= grad[[0,0]] * learning_rate;
             }
             
@@ -481,7 +481,7 @@ mod tests {
         
         let hessian = (&grad2 - &grad1) / epsilon;
         
-        if let crate::tensor::TensorData::Cpu(ref mut d) = x_newton.write().unwrap().data {
+        if let crate::backend::TensorData::Cpu(ref mut d) = x_newton.write().unwrap().data {
             d[0] -= grad1[[0,0]] / hessian[[0,0]];
         }
         
@@ -528,7 +528,7 @@ mod tests {
         params.push(Arc::clone(&layer1.weights)); params.push(Arc::clone(&layer1.bias));
         params.push(Arc::clone(&layer2.weights)); params.push(Arc::clone(&layer2.bias));
 
-        let optimizer = SGD::new(0.05, params);
+        let mut optimizer = AdamW::new(0.05, params); // UPGRADED
 
         println!("Training GNN for 500 Epochs...");
 
@@ -581,7 +581,7 @@ mod tests {
         params.push(Arc::clone(&layer1.weights)); params.push(Arc::clone(&layer1.bias));
         params.push(Arc::clone(&layer2.weights)); params.push(Arc::clone(&layer2.bias));
 
-        let optimizer = SGD::new(0.01, params);
+        let mut optimizer = AdamW::new(0.01, params); // UPGRADED
         let mut rng = rand::rng();
         let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
 
@@ -636,40 +636,6 @@ mod tests {
 
         println!("--- DIFFUSION ENGINE COMPLETE ---\n");
     }
-
-    /* TODO: Uncomment and upgrade to Arc<RwLock> for v2.0.0
-    #[test]
-    fn test_complex_initialization() {
-        let data = array![[Complex32::new(1.0, 2.0)]];
-        let tensor = ComplexTensor::new(data);
-
-        // Intentionally left as .borrow() assuming ComplexTensor hasn't been upgraded to Arc<RwLock> yet.
-        let t = tensor.borrow();
-        assert_eq!(t.data[[0, 0]].re, 1.0);
-        assert_eq!(t.data[[0, 0]].im, 2.0);
-        println!("Complex Tensor initialized successfully!");
-    }
-    
-    #[test]
-    fn test_frequency_learning() {
-        println!("\n--- BOOTING WAVE FREQUENCY DETECTION TEST ---");
-        let mut data = Array2::zeros((1, 8));
-        for i in 0..8 {
-            let phase = (i as f32) * 0.5;
-            data[[0, i]] = Complex32::from_polar(1.0, phase);
-        }
-        let input = ComplexTensor::new(data);
-        let weights = ComplexTensor::new(Array2::from_elem((8, 8), Complex32::new(0.5, 0.5)));
-        let output = ComplexTensor::matmul(&input, &weights);
-
-        let result = output.borrow();
-        println!("Wave Projection Output (first 3 points):");
-        println!("{:?}", result.data.slice(ndarray::s![0, 0..3]));
-
-        assert!(result.data[[0,0]].norm() > 0.0, "Frequency projection failed!");
-        println!("--- FREQUENCY DETECTION TEST PASSED ---\n");
-    }
-    */
 
     // ---------------------------------------------------------
     // PHASE 1 VERIFICATION: ELEMENT-WISE ARITHMETIC CORE
