@@ -1,11 +1,32 @@
+/*
+ * src/export.rs
+ *
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Rakesh Pradip Dey
+ *
+ * Licensed under the MIT License <LICENSE-MIT or http://opensource.org/licenses/MIT>.
+ * 
+ * Note: Portions of this software are adapted from existing open-source frameworks.
+ * This file may not be copied, modified, or distributed except according to the terms
+ * of the MIT license.
+ */
+
+//! ONNX Exporter for the Organon Engine.
+//!
+//! This module provides the capability to serialize the internal computation
+//! graph into the ONNX (Open Neural Network Exchange) binary format. This
+//! enables deployment of trained models to diverse inference environments
+//! such as TensorRT, CoreML, and standard ONNX Runtimes.
+
 use prost::Message;
 use std::fs::File;
 use std::io::Write;
 use crate::backend::{ComputeGraph, Opcode};
 
-// ========================================================================
-// ONNX PROTOBUF DEFINITIONS (Hand-rolled to avoid build.rs complexities)
-// ========================================================================
+// ONNX PROTOBUF DEFINITIONS 
+// These structs provide a compact binary representation for ONNX compatibility.
+// They are manually defined to remain lightweight and avoid complex dependencies.
+
 #[derive(Clone, PartialEq, Message)]
 pub struct ModelProto {
     #[prost(int64, tag="1")]
@@ -34,17 +55,25 @@ pub struct NodeProto {
     pub op_type: String,
 }
 
-// ========================================================================
 // THE EXPORTER ENGINE
-// ========================================================================
+
+/// Handles the translation of internal `ComputeGraph` operations to standard ONNX 
+/// operator definitions.
 pub struct ONNXExporter;
 
 impl ONNXExporter {
+    /// Serializes the graph to an `.onnx` file.
+    ///
+    /// # Arguments
+    /// * `graph` - The internal compute graph to be translated.
+    /// * `filepath` - Destination file path for the exported model.
     pub fn export(graph: &ComputeGraph, filepath: &str) -> std::io::Result<()> {
         let mut nodes = Vec::new();
 
         for node in &graph.nodes {
-            // Translate Organon Opcodes to official ONNX standard operators
+            // Translate Organon Opcodes to official ONNX standard operators.
+            // Note: Some custom kernels (like PagedAttention) do not map directly 
+            // to ONNX and will trigger warnings upon export.
             let op_type = match node.op {
                 Opcode::MatMul => "MatMul",
                 Opcode::Add => "Add",
@@ -62,8 +91,14 @@ impl ONNXExporter {
                 Opcode::BatchNorm => "BatchNormalization",
                 Opcode::Sigmoid => "Sigmoid",
                 Opcode::Tanh => "Tanh",
-                Opcode::Input => continue, // Handled implicitly as graph inputs
-                _ => "UnknownOp", // Graceful fallback
+                Opcode::TopK(_) => "TopK",
+                Opcode::PagedAttention => {
+                    println!("WARNING: PagedAttention is a hardware-specific virtual memory kernel and cannot be exported to ONNX. This node will be exported as 'UnknownOp'.");
+                    "UnknownOp"
+                },
+                // Handled implicitly as graph inputs
+                Opcode::Input => continue,
+                _ => "UnknownOp", // fallback
             };
 
             let inputs: Vec<String> = node.dependencies.iter().map(|id| format!("tensor_{}", id)).collect();
@@ -82,18 +117,20 @@ impl ONNXExporter {
         };
 
         let model = ModelProto {
-            ir_version: 8, // Standard ONNX IR version
+            // Standard ONNX IR version
+            ir_version: 8,
             producer_name: "Organon Framework".to_string(),
             graph: Some(onnx_graph),
         };
 
+        // Serialize to binary Protobuf
         let mut buf = Vec::new();
         model.encode(&mut buf).unwrap();
 
         let mut file = File::create(filepath)?;
         file.write_all(&buf)?;
         
-        println!("🚀 Model successfully exported to ONNX format at: {}", filepath);
+        println!("Model successfully exported to ONNX format at: {}", filepath);
         Ok(())
     }
 }
