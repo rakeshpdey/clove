@@ -11,7 +11,7 @@
  * of the MIT license.
  */
 
-//! Embedding layer implementation for the Organon Engine.
+//! Embedding layer implementation for the Clove Engine.
 //!
 //! This module provides the `Embedding` layer, which acts as the entry point
 //! for NLP models. It transforms discrete integer token indices into

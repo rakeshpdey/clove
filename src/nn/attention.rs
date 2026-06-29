@@ -18,7 +18,7 @@
 //!
 //! # JIT Optimization
 //! Note that the mathematical operations defined in `forward` are not executed
-//! as individual kernels. The Organon JIT Compiler's XLA Pattern Matcher
+//! as individual kernels. The Clove JIT Compiler's XLA Pattern Matcher
 //! automatically detects the `MatMul(Softmax(MatMul))` sequence and fuses this
 //! entire logic into a single, high-throughput FlashAttention WGSL kernel
 //! at runtime.

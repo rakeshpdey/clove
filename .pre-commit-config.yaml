@@ -1,4 +1,4 @@
-Pre-commit configuration for Organon
+Pre-commit configuration for Clove
 
 This automatically formats and lints code before allowing a git commit.
 

@@ -11,7 +11,7 @@
  * of the MIT license.
  */
 
-//! The core computation backend for the Organon Engine.
+//! The core computation backend for the Clove Engine.
 //! This module houses the Intermediate Representation (IR) for the JIT compiler,
 //! the Symbolic Shape tracking engine, and the raw WebGPU (WGSL) and CPU (Rayon)
 //! kernel implementations for all neural network operations.

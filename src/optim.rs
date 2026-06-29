@@ -12,7 +12,7 @@
  * of the MIT license.
  */
 
-//! Optimizer and Learning Rate Scheduler module for Organon.
+//! Optimizer and Learning Rate Scheduler module for Clove.
 //!
 //! This module implements essential training utilities, including common
 //! learning rate scheduling strategies and a robust Automatic Mixed

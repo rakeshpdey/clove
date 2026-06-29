@@ -10,7 +10,7 @@
  * This file may not be copied, modified, or distributed except according to the terms
  * of the MIT license.
  */
-//! Neural Ordinary Differential Equations (ODE) for the Organon Engine.
+//! Neural Ordinary Differential Equations (ODE) for the Clove Engine.
 //!
 //! This module implements a Neural ODE layer, where the hidden state dynamics
 //! are modeled as a continuous function. Instead of traditional discrete

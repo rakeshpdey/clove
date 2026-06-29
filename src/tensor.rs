@@ -11,7 +11,7 @@
  * of the MIT license.
  */
 
-//! Core Tensor and Autograd Engine for the Organon Engine.
+//! Core Tensor and Autograd Engine for the Clove Engine.
 //!
 //! This module defines the `TensorGraph`, the fundamental data structure
 //! used for all computations. It implements the Reverse-Mode Automatic

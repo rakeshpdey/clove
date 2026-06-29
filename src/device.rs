@@ -27,7 +27,7 @@ use wgpu::Buffer;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
-/// Defines the compute hardware backend for the Organon Engine.
+/// Defines the compute hardware backend for the Clove Engine.
 /// This abstraction allows the same graph to run on local CPUs,
 /// high-performance GPUs, or edge-native WebAssembly environments.
 #[derive(Clone)]

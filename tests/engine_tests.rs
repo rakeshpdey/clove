@@ -5,16 +5,17 @@
  * Copyright (c) 2026 Rakesh Pradip Dey
  */
 
-use organon::nn::Linear;
-use organon::optim::AdamW;
-use organon::tensor::{Node, Tensor};
+use clove::nn::Linear;
+use clove::optim::AdamW;
+use clove::tensor::{Node, Tensor};
 use ndarray::{Array2, array};
 use std::sync::Arc;
 
-// TEST HELPERS: Bridging Arc<RwLock> back to ndarray
+// TEST HELPERS
 fn to_arr(node: &Node) -> Array2<f32> {
     let t = node.read().unwrap();
-    if let organon::backend::TensorData::Cpu(ref vec) = t.data {
+    // Assuming you made TensorData and related types pub
+    if let clove::backend::TensorData::Cpu(ref vec) = t.data {
         Array2::from_shape_vec((t.shape[0], t.shape[1]), vec.clone()).expect("Shape mismatch")
     } else {
         panic!("Test Failed: Cannot extract ndarray from GPU Tensor.");
@@ -489,7 +490,7 @@ fn test_second_order_calculus() {
         let grad = grad_to_arr(&x_sgd);
 
         // Adjust weights via safe inner lock traversal
-        if let organon::backend::TensorData::Cpu(ref mut d) = x_sgd.write().unwrap().data {
+        if let clove::backend::TensorData::Cpu(ref mut d) = x_sgd.write().unwrap().data {
             d[0] -= grad[[0, 0]] * learning_rate;
         }
 
@@ -516,7 +517,7 @@ fn test_second_order_calculus() {
 
     let hessian = (&grad2 - &grad1) / epsilon;
 
-    if let organon::backend::TensorData::Cpu(ref mut d) = x_newton.write().unwrap().data {
+    if let clove::backend::TensorData::Cpu(ref mut d) = x_newton.write().unwrap().data {
         d[0] -= grad1[[0, 0]] / hessian[[0, 0]];
     }
 

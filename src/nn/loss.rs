@@ -12,7 +12,7 @@
  * of the MIT license.
  */
 
-//! Objective functions for the Organon Engine.
+//! Objective functions for the Clove Engine.
 //!
 //! This module implements standard loss functions required for supervised learning,
 //! including classification objectives like `CrossEntropyLoss` and regression

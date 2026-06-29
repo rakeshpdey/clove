@@ -12,7 +12,7 @@
  * of the MIT license.
  */
 
-//! Neural Network Modules for the Organon Engine.
+//! Neural Network Modules for the Clove Engine.
 //!
 //! This module serves as the primary API for high-level neural network components.
 //! It defines the core `Module` trait and provides a library of pre-built layers,

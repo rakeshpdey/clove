@@ -12,7 +12,7 @@
  * of the MIT license.
  */
 
-//! Data augmentation, loading, and tokenization utilities for the Organon Engine.
+//! Data augmentation, loading, and tokenization utilities for the Clove Engine.
 //!
 //! This module provides high-performance data loading infrastructure, including
 //! asynchronous background pre-fetching, multi-threaded augmentation pipelines

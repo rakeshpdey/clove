@@ -1,6 +1,6 @@
 Changelog
 
-All notable changes to the Organon framework will be documented in this file.
+All notable changes to the Clove framework will be documented in this file.
 
 The format is based on Keep a Changelog,
 and this project adheres to Semantic Versioning.
@@ -17,7 +17,7 @@ Advanced memory pooling for WebGPU buffers to eliminate driver allocation overhe
 
 Added
 
-Initial release of the Organon Engine.
+Initial release of the Clove Engine.
 
 LazyBackend JIT compiler with WGSL kernel fusion.
 

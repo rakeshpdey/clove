@@ -11,7 +11,7 @@
  * of the MIT license.
  */
 
-//! ONNX Exporter for the Organon Engine.
+//! ONNX Exporter for the Clove Engine.
 //!
 //! This module provides the capability to serialize the internal computation
 //! graph into the ONNX (Open Neural Network Exchange) binary format. This
@@ -71,7 +71,7 @@ impl ONNXExporter {
         let mut nodes = Vec::new();
 
         for node in &graph.nodes {
-            // Translate Organon Opcodes to official ONNX standard operators.
+            // Translate Clove Opcodes to official ONNX standard operators.
             // Note: Some custom kernels (like PagedAttention) do not map directly 
             // to ONNX and will trigger warnings upon export.
             let op_type = match node.op {
@@ -119,7 +119,7 @@ impl ONNXExporter {
         let model = ModelProto {
             // Standard ONNX IR version
             ir_version: 8,
-            producer_name: "Organon Framework".to_string(),
+            producer_name: "Clove Framework".to_string(),
             graph: Some(onnx_graph),
         };
 

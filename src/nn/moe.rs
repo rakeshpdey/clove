@@ -11,7 +11,7 @@
  * This file may not be copied, modified, or distributed except according to the terms
  * of the MIT license.
  */
-//! Mixture-of-Experts (MoE) Architecture for the Organon Engine.
+//! Mixture-of-Experts (MoE) Architecture for the Clove Engine.
 //!
 //! This module implements sparse neural network layers where the model routes
 //! inputs to a subset of specialized "expert" networks. This allows for models

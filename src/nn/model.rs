@@ -12,7 +12,7 @@
  * of the MIT license.
  */
 
-//! Transformer Language Model Implementation for the Organon Engine.
+//! Transformer Language Model Implementation for the Clove Engine.
 //!
 //! This module defines the `LanguageModel` struct, which serves as the top-level
 //! architecture for transformer-based neural networks. It orchestrates the

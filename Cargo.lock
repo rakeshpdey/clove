@@ -196,6 +196,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "clove"
+version = "1.0.0"
+dependencies = [
+ "bytemuck",
+ "js-sys",
+ "memmap2",
+ "ndarray",
+ "num-complex",
+ "num-traits",
+ "num_cpus",
+ "pollster",
+ "prost",
+ "rand 0.10.1",
+ "rand_distr",
+ "rayon",
+ "safetensors",
+ "tokenizers",
+ "tokio",
+ "wasm-bindgen",
+ "web-sys",
+ "wgpu",
+]
+
+[[package]]
 name = "codespan-reporting"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1305,30 +1329,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7d950ca161dc355eaf28f82b11345ed76c6e1f6eb1f4f4479e0323b9e2fbd0e"
 dependencies = [
  "num-traits",
-]
-
-[[package]]
-name = "organon"
-version = "1.0.0"
-dependencies = [
- "bytemuck",
- "js-sys",
- "memmap2",
- "ndarray",
- "num-complex",
- "num-traits",
- "num_cpus",
- "pollster",
- "prost",
- "rand 0.10.1",
- "rand_distr",
- "rayon",
- "safetensors",
- "tokenizers",
- "tokio",
- "wasm-bindgen",
- "web-sys",
- "wgpu",
 ]
 
 [[package]]
