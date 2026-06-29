@@ -264,14 +264,23 @@ pub struct WgpuBackend;
 impl WgpuBackend {
     /// Highly optimized, multithreaded CPU Matrix Multiplication
     pub fn rayon_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+        // Transpose B so columns become rows (contiguous access)
+        let mut b_transposed = vec![0.0; k * n];
+        for i in 0..k {
+            for j in 0..n {
+                b_transposed[j * k + i] = b[i * n + j];
+            }
+        }
         let mut result = vec![0.0; m * n];
         result.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
             for j in 0..n {
                 let mut sum = 0.0;
+                let row_b = &b_transposed[j * k..(j + 1) * k];
+                let row_a = &a[i * k..(i + 1) * k];
                 for p in 0..k {
-                    sum += a[i * k + p] * b[p * n + j];
+                    sum += row_a[p] * row_b[p];
                 }
-                row[j] = if sum.is_nan() { 0.0 } else { sum };
+                row[j] = sum;
             }
         });
         result
