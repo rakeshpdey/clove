@@ -8,6 +8,7 @@ repository = "https://github.com/rakeshpdey/clove"
 readme = "README.md"
 keywords = ["machine-learning", "neural-network", "webgpu", "tensor"]
 categories = ["science", "mathematics", "wasm"]
+exclude = ["data/**"]
 
 [dependencies]
 bytemuck = "1.25.0"
@@ -40,7 +41,3 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-
-exclude = [
-    "data/**"
-]
