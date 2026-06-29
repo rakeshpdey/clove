@@ -1,7 +1,13 @@
 [package]
 name = "clove"
-version = "1.0.0"
+version = "0.1.0"
 edition = "2024"
+description = "A high-performance, hardware-agnostic Machine Learning framework written purely in Rust."
+license = "MIT"
+repository = "https://github.com/rakeshpdey/clove"
+readme = "README.md"
+keywords = ["machine-learning", "neural-network", "webgpu", "tensor"]
+categories = ["science", "mathematics", "wasm"]
 
 [dependencies]
 bytemuck = "1.25.0"
