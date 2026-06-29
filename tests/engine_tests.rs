@@ -177,13 +177,14 @@ fn test_deep_learning_xor() {
     let layer2 = Linear::new(16, 16);
     let layer3 = Linear::new(16, 1);
 
-    let mut params = Vec::new();
-    params.push(Arc::clone(&layer1.weights));
-    params.push(Arc::clone(&layer1.bias));
-    params.push(Arc::clone(&layer2.weights));
-    params.push(Arc::clone(&layer2.bias));
-    params.push(Arc::clone(&layer3.weights));
-    params.push(Arc::clone(&layer3.bias));
+    let params = vec![
+        Arc::clone(&layer1.weights),
+        Arc::clone(&layer1.bias),
+        Arc::clone(&layer2.weights),
+        Arc::clone(&layer2.bias),
+        Arc::clone(&layer3.weights),
+        Arc::clone(&layer3.bias),
+    ];
 
     let mut optimizer = AdamW::new(0.1, params);
 
@@ -234,11 +235,12 @@ fn test_statistical_classification() {
     let layer1 = Linear::new(2, 8);
     let layer2 = Linear::new(8, 2);
 
-    let mut params = Vec::new();
-    params.push(Arc::clone(&layer1.weights));
-    params.push(Arc::clone(&layer1.bias));
-    params.push(Arc::clone(&layer2.weights));
-    params.push(Arc::clone(&layer2.bias));
+    let params = vec![
+        Arc::clone(&layer1.weights),
+        Arc::clone(&layer1.bias),
+        Arc::clone(&layer2.weights),
+        Arc::clone(&layer2.bias),
+    ];
 
     let mut optimizer = AdamW::new(0.05, params);
 
@@ -411,11 +413,12 @@ fn test_physics_informed_neural_network() {
     let layer1 = Linear::new(1, 16);
     let layer2 = Linear::new(16, 1);
 
-    let mut params = Vec::new();
-    params.push(Arc::clone(&layer1.weights));
-    params.push(Arc::clone(&layer1.bias));
-    params.push(Arc::clone(&layer2.weights));
-    params.push(Arc::clone(&layer2.bias));
+    let params = vec![
+        Arc::clone(&layer1.weights),
+        Arc::clone(&layer1.bias),
+        Arc::clone(&layer2.weights),
+        Arc::clone(&layer2.bias),
+    ];
 
     let mut optimizer = AdamW::new(0.01, params);
 
@@ -552,11 +555,12 @@ fn test_graph_neural_network() {
     let layer1 = Linear::new(2, 8);
     let layer2 = Linear::new(8, 1);
 
-    let mut params = Vec::new();
-    params.push(Arc::clone(&layer1.weights));
-    params.push(Arc::clone(&layer1.bias));
-    params.push(Arc::clone(&layer2.weights));
-    params.push(Arc::clone(&layer2.bias));
+    let params = vec![
+        Arc::clone(&layer1.weights),
+        Arc::clone(&layer1.bias),
+        Arc::clone(&layer2.weights),
+        Arc::clone(&layer2.bias),
+    ];
 
     let mut optimizer = AdamW::new(0.05, params);
 
@@ -613,11 +617,12 @@ fn test_stochastic_diffusion() {
     let layer1 = Linear::new(8, 32);
     let layer2 = Linear::new(32, 8);
 
-    let mut params = Vec::new();
-    params.push(Arc::clone(&layer1.weights));
-    params.push(Arc::clone(&layer1.bias));
-    params.push(Arc::clone(&layer2.weights));
-    params.push(Arc::clone(&layer2.bias));
+    let params = vec![
+        Arc::clone(&layer1.weights),
+        Arc::clone(&layer1.bias),
+        Arc::clone(&layer2.weights),
+        Arc::clone(&layer2.bias),
+    ];
 
     let mut optimizer = AdamW::new(0.01, params);
     let mut rng = rand::rng();
