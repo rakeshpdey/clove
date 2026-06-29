@@ -1,0 +1,27 @@
+Pre-commit configuration for Organon
+
+This automatically formats and lints code before allowing a git commit.
+
+repos:
+
+Standard text formatting hooks
+
+repo: https://github.com/pre-commit/pre-commit-hooks
+rev: v4.4.0
+hooks:
+
+id: trailing-whitespace
+
+id: end-of-file-fixer
+
+id: check-yaml
+
+Rust specific hooks (Cargo fmt and Clippy)
+
+repo: https://github.com/doublify/pre-commit-rust
+rev: v1.0
+hooks:
+
+id: fmt
+
+id: clippy
