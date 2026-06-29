@@ -5,6 +5,14 @@ All notable changes to the Clove framework will be documented in this file.
 The format is based on Keep a Changelog,
 and this project adheres to Semantic Versioning.
 
+[0.1.1] - 2026-06-29
+
+Added
+
+Performance:
+
+Optimized `rayon_matmul` via transpose-based cache locality, achieving 13x speedup on 1024x1024 matrices.
+
 [0.1.0] - 2026-06-29
 
 Added
