@@ -5,6 +5,16 @@ All notable changes to the Clove framework will be documented in this file.
 The format is based on Keep a Changelog,
 and this project adheres to Semantic Versioning.
 
+[0.1.2] - 2026-06-30
+
+Added
+
+Universal FFI Bridge:
+
+Exposed complete math suite and neural network primitives to foreign languages.
+Implemented `clove_optimizer_create`, `step`, and `zero_grad` for full GPU-side training loops.
+Added strict `# Safety` documentation for all FFI operations to meet Rust production standards.
+
 [0.1.1] - 2026-06-29
 
 Added
