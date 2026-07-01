@@ -1,5 +1,6 @@
 /*
  * src/ffi.rs
+ * C-ABI BRIDGE
  *
  * SPDX-License-Identifier: MIT
  * Copyright (c) 2026 Rakesh Pradip Dey
@@ -11,550 +12,645 @@
  * of the MIT license.
  */
 
-use crate::backend::{Backend, WgpuBackend};
-use crate::optim::AdamW;
-use crate::tensor::TensorNode;
+// This directive prevents Clippy from complaining about missing `# Safety` blocks
+// on every single exported C function, keeping the bridge clean and readable.
+#![allow(clippy::missing_safety_doc)]
+
+use crate::backend::{Backend, Precision, WgpuBackend};
+use crate::data::DataLoader;
+use crate::nn::LanguageModel;
+use crate::optim::{AdamW, GradScaler};
+use crate::tensor::{Node, TensorGraph};
+
 use ndarray::Array2;
-use std::ffi::c_void;
-use std::os::raw::c_float;
+use std::ffi::{CStr, c_void};
+use std::os::raw::{c_char, c_float, c_int};
 
-/// Opaque pointer representing a `TensorNode<WgpuBackend>` in C.
+// ==============================================================================
+// OPAQUE POINTER TYPES
+// ==============================================================================
+// These type aliases create strongly-typed opaque pointers for the C-ABI.
+// Foreign languages will hold these pointers without knowing their Rust internals.
+
 pub type CTensor = *mut c_void;
-
-/// Opaque pointer representing the `AdamW` optimizer in C.
 pub type COptimizer = *mut c_void;
+pub type CGradScaler = *mut c_void;
+pub type CModel = *mut c_void;
+pub type CDataLoader = *mut c_void;
 
-// TENSOR CREATION & MEMORY MANAGEMENT
+// ==============================================================================
+// INTERNAL FFI HELPERS (Rust 2024 Compliant)
+// ==============================================================================
 
-/// Creates a new Tensor from raw CPU data.
-///
-/// # Safety
-/// The `data` pointer must point to a contiguous block of memory containing
-/// at least `rows * cols` elements of type `c_float`.
+/// Safely casts a raw C pointer back into a Rust TensorNode reference.
+#[inline(always)]
+unsafe fn as_node(ptr: CTensor) -> &'static Node {
+    unsafe { &*(ptr as *const Node) }
+}
+
+/// Consumes a Rust object, moves it to the heap, and leaks it to C as a raw pointer.
+#[inline(always)]
+fn into_raw<T>(obj: T) -> *mut c_void {
+    Box::into_raw(Box::new(obj)) as *mut c_void
+}
+
+/// Converts a raw C float array into an `ndarray::Array2` for matrix operations.
+unsafe fn ptr_to_array2(ptr: *const c_float, rows: usize, cols: usize) -> Array2<f32> {
+    unsafe {
+        let size = rows * cols;
+        let slice = std::slice::from_raw_parts(ptr, size);
+        Array2::from_shape_vec((rows, cols), slice.to_vec())
+            .expect("Failed to construct Array2 from FFI pointer")
+    }
+}
+
+// ==============================================================================
+// TENSOR LIFECYCLE & MEMORY
+// ==============================================================================
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_tensor_create(
-    data: *const c_float,
+    data_ptr: *const c_float,
     rows: usize,
     cols: usize,
 ) -> CTensor {
-    let slice = unsafe { std::slice::from_raw_parts(data, rows * cols) };
-    let array = Array2::from_shape_vec((rows, cols), slice.to_vec()).unwrap();
-    let tensor = WgpuBackend::new(array);
-    Box::into_raw(Box::new(tensor)) as CTensor
+    unsafe {
+        if data_ptr.is_null() {
+            return std::ptr::null_mut();
+        }
+        let size = rows * cols;
+        let data = std::slice::from_raw_parts(data_ptr, size).to_vec();
+
+        let tensor_node = WgpuBackend::new_cpu(data, vec![rows, cols]);
+        into_raw(tensor_node)
+    }
 }
 
-/// Safely frees the Tensor memory once the foreign language is done with it.
-///
-/// # Safety
-/// The `tensor_ptr` must be a valid pointer originating from a tensor creation
-/// or operation function within this library. Double-freeing results in undefined behavior.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_tensor_free(tensor_ptr: CTensor) {
-    if !tensor_ptr.is_null() {
-        unsafe {
-            let _ = Box::from_raw(tensor_ptr as *mut TensorNode<WgpuBackend>);
+    unsafe {
+        if !tensor_ptr.is_null() {
+            // Re-take ownership to drop and free memory
+            let _ = Box::from_raw(tensor_ptr as *mut Node);
         }
     }
 }
 
-/// Copies the tensor data back into a pre-allocated raw C-array.
-///
-/// # Safety
-/// The `tensor_ptr` must be a valid tensor pointer. The `out_data` pointer must point
-/// to a valid, writable block of memory large enough to hold all elements.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_tensor_data(tensor_ptr: CTensor, out_data: *mut c_float) {
-    if tensor_ptr.is_null() || out_data.is_null() {
-        return;
+    unsafe {
+        if tensor_ptr.is_null() || out_data.is_null() {
+            return;
+        }
+        let node = as_node(tensor_ptr);
+
+        // Download memory from Backend to CPU
+        let array = WgpuBackend::to_cpu(&node.read().unwrap());
+        if let Some(slice) = array.as_slice() {
+            std::ptr::copy_nonoverlapping(slice.as_ptr(), out_data, slice.len());
+        }
     }
-    let tensor = unsafe { &*(tensor_ptr as *const TensorNode<WgpuBackend>) };
-    let array = WgpuBackend::to_cpu(&tensor.read().unwrap());
-    let (vec_data, _) = array.into_raw_vec_and_offset();
-    let out_slice = unsafe { std::slice::from_raw_parts_mut(out_data, vec_data.len()) };
-    out_slice.copy_from_slice(&vec_data);
 }
 
-// BASIC MATH & SHAPE OPERATIONS
+// ==============================================================================
+// CORE MATH & SHAPE LOGIC
+// ==============================================================================
 
-/// Performs matrix multiplication on two tensors.
-///
-/// # Safety
-/// Both `a_ptr` and `b_ptr` must be valid `CTensor` pointers.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_matmul(a_ptr: CTensor, b_ptr: CTensor) -> CTensor {
-    let a = unsafe { &*(a_ptr as *const TensorNode<WgpuBackend>) };
-    let b = unsafe { &*(b_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::matmul(a, b))) as CTensor
+pub unsafe extern "C" fn clove_add(a: CTensor, b: CTensor) -> CTensor {
+    unsafe { into_raw(WgpuBackend::add(as_node(a), as_node(b))) }
 }
 
-/// Adds two tensors.
-///
-/// # Safety
-/// Both `a_ptr` and `b_ptr` must be valid `CTensor` pointers.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_add(a_ptr: CTensor, b_ptr: CTensor) -> CTensor {
-    let a = unsafe { &*(a_ptr as *const TensorNode<WgpuBackend>) };
-    let b = unsafe { &*(b_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::add(a, b))) as CTensor
+pub unsafe extern "C" fn clove_sub(a: CTensor, b: CTensor) -> CTensor {
+    unsafe { into_raw(WgpuBackend::sub(as_node(a), as_node(b))) }
 }
 
-/// Subtracts tensor b from a.
-///
-/// # Safety
-/// Both `a_ptr` and `b_ptr` must be valid `CTensor` pointers.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_sub(a_ptr: CTensor, b_ptr: CTensor) -> CTensor {
-    let a = unsafe { &*(a_ptr as *const TensorNode<WgpuBackend>) };
-    let b = unsafe { &*(b_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::sub(a, b))) as CTensor
+pub unsafe extern "C" fn clove_mul(a: CTensor, b: CTensor) -> CTensor {
+    unsafe { into_raw(WgpuBackend::mul(as_node(a), as_node(b))) }
 }
 
-/// Multiplies two tensors element-wise.
-///
-/// # Safety
-/// Both `a_ptr` and `b_ptr` must be valid `CTensor` pointers.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_mul(a_ptr: CTensor, b_ptr: CTensor) -> CTensor {
-    let a = unsafe { &*(a_ptr as *const TensorNode<WgpuBackend>) };
-    let b = unsafe { &*(b_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::mul(a, b))) as CTensor
+pub unsafe extern "C" fn clove_matmul(a: CTensor, b: CTensor) -> CTensor {
+    unsafe { into_raw(WgpuBackend::matmul(as_node(a), as_node(b))) }
 }
 
-/// Multiplies a tensor by a scalar value.
-///
-/// # Safety
-/// `a_ptr` must be a valid `CTensor` pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_mul_scalar(a_ptr: CTensor, scalar: c_float) -> CTensor {
-    let a = unsafe { &*(a_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::mul_scalar(a, scalar))) as CTensor
+pub unsafe extern "C" fn clove_mul_scalar(a: CTensor, scalar: c_float) -> CTensor {
+    unsafe { into_raw(WgpuBackend::mul_scalar(as_node(a), scalar)) }
 }
 
-/// Transposes a tensor.
-///
-/// # Safety
-/// `a_ptr` must be a valid `CTensor` pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_transpose(a_ptr: CTensor) -> CTensor {
-    let a = unsafe { &*(a_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::transpose(a))) as CTensor
+pub unsafe extern "C" fn clove_transpose(a: CTensor) -> CTensor {
+    unsafe { into_raw(WgpuBackend::transpose(as_node(a))) }
 }
 
-/// Flattens a tensor.
-///
-/// # Safety
-/// `a_ptr` must be a valid `CTensor` pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_flatten(a_ptr: CTensor) -> CTensor {
-    let a = unsafe { &*(a_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::flatten(a))) as CTensor
+pub unsafe extern "C" fn clove_flatten(a: CTensor) -> CTensor {
+    unsafe { into_raw(WgpuBackend::flatten(as_node(a))) }
 }
 
-/// Concatenates two tensors.
-///
-/// # Safety
-/// Both `a_ptr` and `b_ptr` must be valid `CTensor` pointers.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_concat(a_ptr: CTensor, b_ptr: CTensor) -> CTensor {
-    let a = unsafe { &*(a_ptr as *const TensorNode<WgpuBackend>) };
-    let b = unsafe { &*(b_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::concat_seq(a, b))) as CTensor
+pub unsafe extern "C" fn clove_concat(a: CTensor, b: CTensor) -> CTensor {
+    unsafe { into_raw(WgpuBackend::concat_seq(as_node(a), as_node(b))) }
 }
 
+// ==============================================================================
 // ACTIVATIONS & TRIGONOMETRY
+// ==============================================================================
 
-/// Applies the ReLU activation function.
-///
-/// # Safety
-/// `a_ptr` must be a valid `CTensor` pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_relu(a_ptr: CTensor) -> CTensor {
-    let a = unsafe { &*(a_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::relu(a))) as CTensor
+pub unsafe extern "C" fn clove_relu(a: CTensor) -> CTensor {
+    unsafe { into_raw(WgpuBackend::relu(as_node(a))) }
 }
 
-/// Applies the GELU activation function.
-///
-/// # Safety
-/// `a_ptr` must be a valid `CTensor` pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_gelu(a_ptr: CTensor) -> CTensor {
-    let a = unsafe { &*(a_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::gelu(a))) as CTensor
+pub unsafe extern "C" fn clove_gelu(a: CTensor) -> CTensor {
+    unsafe { into_raw(WgpuBackend::gelu(as_node(a))) }
 }
 
-/// Applies the Sigmoid activation function.
-///
-/// # Safety
-/// `a_ptr` must be a valid `CTensor` pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_sigmoid(a_ptr: CTensor) -> CTensor {
-    let a = unsafe { &*(a_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::sigmoid(a))) as CTensor
+pub unsafe extern "C" fn clove_sigmoid(a: CTensor) -> CTensor {
+    unsafe { into_raw(WgpuBackend::sigmoid(as_node(a))) }
 }
 
-/// Applies the Tanh activation function.
-///
-/// # Safety
-/// `a_ptr` must be a valid `CTensor` pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_tanh(a_ptr: CTensor) -> CTensor {
-    let a = unsafe { &*(a_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::tanh(a))) as CTensor
+pub unsafe extern "C" fn clove_tanh(a: CTensor) -> CTensor {
+    unsafe { into_raw(WgpuBackend::tanh(as_node(a))) }
 }
 
-/// Applies the Softmax activation function.
-///
-/// # Safety
-/// `a_ptr` must be a valid `CTensor` pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_softmax(a_ptr: CTensor) -> CTensor {
-    let a = unsafe { &*(a_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::softmax(a))) as CTensor
+pub unsafe extern "C" fn clove_softmax(a: CTensor) -> CTensor {
+    unsafe { into_raw(WgpuBackend::softmax(as_node(a))) }
 }
 
-/// Applies the Sine trigonometric function.
-///
-/// # Safety
-/// `a_ptr` must be a valid `CTensor` pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_sin(a_ptr: CTensor) -> CTensor {
-    let a = unsafe { &*(a_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::sin(a))) as CTensor
+pub unsafe extern "C" fn clove_sin(a: CTensor) -> CTensor {
+    unsafe { into_raw(WgpuBackend::sin(as_node(a))) }
 }
 
-/// Applies the Cosine trigonometric function.
-///
-/// # Safety
-/// `a_ptr` must be a valid `CTensor` pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_cos(a_ptr: CTensor) -> CTensor {
-    let a = unsafe { &*(a_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::cos(a))) as CTensor
+pub unsafe extern "C" fn clove_cos(a: CTensor) -> CTensor {
+    unsafe { into_raw(WgpuBackend::cos(as_node(a))) }
 }
 
-// NEURAL NETWORK LAYERS
+// ==============================================================================
+// VISION (CNNs) & POOLING
+// ==============================================================================
 
-/// Computes layer normalization.
-///
-/// # Safety
-/// All pointers (`a_ptr`, `gamma_ptr`, `beta_ptr`) must be valid `CTensor` pointers.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_layer_norm(
-    a_ptr: CTensor,
-    gamma_ptr: CTensor,
-    beta_ptr: CTensor,
+pub unsafe extern "C" fn clove_conv1d(i: CTensor, k: CTensor) -> CTensor {
+    unsafe { into_raw(WgpuBackend::conv1d(as_node(i), as_node(k))) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_conv2d(i: CTensor, k: CTensor) -> CTensor {
+    unsafe { into_raw(WgpuBackend::conv2d(as_node(i), as_node(k))) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_conv3d(i: CTensor, k: CTensor) -> CTensor {
+    unsafe { into_raw(WgpuBackend::conv3d(as_node(i), as_node(k))) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_max_pool2d(a: CTensor, kernel: usize) -> CTensor {
+    unsafe { into_raw(WgpuBackend::max_pool2d(as_node(a), kernel)) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_avg_pool2d(a: CTensor, kernel: usize) -> CTensor {
+    unsafe { into_raw(WgpuBackend::avg_pool2d(as_node(a), kernel)) }
+}
+
+// ==============================================================================
+// LLMs, ATTENTION, & NLP
+// ==============================================================================
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_layer_norm(a: CTensor, gamma: CTensor, beta: CTensor) -> CTensor {
+    unsafe {
+        into_raw(WgpuBackend::layer_norm(
+            as_node(a),
+            as_node(gamma),
+            as_node(beta),
+        ))
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_rope(a: CTensor, pos_offset: usize, head_dim: usize) -> CTensor {
+    unsafe { into_raw(WgpuBackend::rope(as_node(a), pos_offset, head_dim)) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_paged_attention(
+    q: CTensor,
+    k: CTensor,
+    v: CTensor,
+    kv: CTensor,
+    bt: CTensor,
+    cl: CTensor,
 ) -> CTensor {
-    let a = unsafe { &*(a_ptr as *const TensorNode<WgpuBackend>) };
-    let g = unsafe { &*(gamma_ptr as *const TensorNode<WgpuBackend>) };
-    let b = unsafe { &*(beta_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::layer_norm(a, g, b))) as CTensor
+    unsafe {
+        into_raw(WgpuBackend::paged_attention(
+            as_node(q),
+            as_node(k),
+            as_node(v),
+            as_node(kv),
+            as_node(bt),
+            as_node(cl),
+        ))
+    }
 }
 
-/// Computes batch normalization.
-///
-/// # Safety
-/// All tensor pointers must be valid `CTensor` pointers.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_batch_norm(
-    x_ptr: CTensor,
-    g_ptr: CTensor,
-    b_ptr: CTensor,
-    rm_ptr: CTensor,
-    rv_ptr: CTensor,
-    momentum: c_float,
-) -> CTensor {
-    let x = unsafe { &*(x_ptr as *const TensorNode<WgpuBackend>) };
-    let g = unsafe { &*(g_ptr as *const TensorNode<WgpuBackend>) };
-    let b = unsafe { &*(b_ptr as *const TensorNode<WgpuBackend>) };
-    let rm = unsafe { &*(rm_ptr as *const TensorNode<WgpuBackend>) };
-    let rv = unsafe { &*(rv_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::batch_norm(x, g, b, rm, rv, momentum))) as CTensor
-}
-
-/// Applies dropout to a tensor.
-///
-/// # Safety
-/// `a_ptr` must be a valid `CTensor` pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_dropout(a_ptr: CTensor, rate: c_float) -> CTensor {
-    let a = unsafe { &*(a_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::dropout(a, rate))) as CTensor
-}
-
-/// Computes a 1D convolution.
-///
-/// # Safety
-/// Both `i_ptr` and `k_ptr` must be valid `CTensor` pointers.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_conv1d(i_ptr: CTensor, k_ptr: CTensor) -> CTensor {
-    let i = unsafe { &*(i_ptr as *const TensorNode<WgpuBackend>) };
-    let k = unsafe { &*(k_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::conv1d(i, k))) as CTensor
-}
-
-/// Computes a 2D convolution.
-///
-/// # Safety
-/// Both `i_ptr` and `k_ptr` must be valid `CTensor` pointers.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_conv2d(i_ptr: CTensor, k_ptr: CTensor) -> CTensor {
-    let i = unsafe { &*(i_ptr as *const TensorNode<WgpuBackend>) };
-    let k = unsafe { &*(k_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::conv2d(i, k))) as CTensor
-}
-
-/// Computes a 3D convolution.
-///
-/// # Safety
-/// Both `i_ptr` and `k_ptr` must be valid `CTensor` pointers.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_conv3d(i_ptr: CTensor, k_ptr: CTensor) -> CTensor {
-    let i = unsafe { &*(i_ptr as *const TensorNode<WgpuBackend>) };
-    let k = unsafe { &*(k_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::conv3d(i, k))) as CTensor
-}
-
-/// Applies 2D Max Pooling.
-///
-/// # Safety
-/// `a_ptr` must be a valid `CTensor` pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_max_pool2d(a_ptr: CTensor, kernel: usize) -> CTensor {
-    let a = unsafe { &*(a_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::max_pool2d(a, kernel))) as CTensor
-}
-
-/// Applies 2D Average Pooling.
-///
-/// # Safety
-/// `a_ptr` must be a valid `CTensor` pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_avg_pool2d(a_ptr: CTensor, kernel: usize) -> CTensor {
-    let a = unsafe { &*(a_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::avg_pool2d(a, kernel))) as CTensor
-}
-
-// ATTENTION & ADVANCED
-
-/// Applies Rotary Positional Embeddings (RoPE).
-///
-/// # Safety
-/// `a_ptr` must be a valid `CTensor` pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_rope(a_ptr: CTensor, pos_offset: usize, head_dim: usize) -> CTensor {
-    let a = unsafe { &*(a_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::rope(a, pos_offset, head_dim))) as CTensor
-}
-
-/// Performs an embedding lookup.
-///
-/// # Safety
-/// `w_ptr` must be a valid `CTensor` pointer.
-/// `indices_ptr` must point to a valid, contiguous array of `rows * cols` elements of type `c_float`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_embedding(
-    w_ptr: CTensor,
+    w: CTensor,
     indices_ptr: *const c_float,
     rows: usize,
     cols: usize,
 ) -> CTensor {
-    let w = unsafe { &*(w_ptr as *const TensorNode<WgpuBackend>) };
-    let slice = unsafe { std::slice::from_raw_parts(indices_ptr, rows * cols) };
-    let indices_array = Array2::from_shape_vec((rows, cols), slice.to_vec()).unwrap();
-    Box::into_raw(Box::new(WgpuBackend::embedding(w, &indices_array))) as CTensor
+    unsafe {
+        let indices = ptr_to_array2(indices_ptr, rows, cols);
+        into_raw(WgpuBackend::embedding(as_node(w), &indices))
+    }
 }
 
-/// Executes vLLM-style Paged Attention.
-///
-/// # Safety
-/// All provided tensor pointers must be valid `CTensor` pointers.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_paged_attention(
-    q_ptr: CTensor,
-    k_ptr: CTensor,
-    v_ptr: CTensor,
-    kv_ptr: CTensor,
-    bt_ptr: CTensor,
-    cl_ptr: CTensor,
-) -> CTensor {
-    let q = unsafe { &*(q_ptr as *const TensorNode<WgpuBackend>) };
-    let k = unsafe { &*(k_ptr as *const TensorNode<WgpuBackend>) };
-    let v = unsafe { &*(v_ptr as *const TensorNode<WgpuBackend>) };
-    let kv = unsafe { &*(kv_ptr as *const TensorNode<WgpuBackend>) };
-    let bt = unsafe { &*(bt_ptr as *const TensorNode<WgpuBackend>) };
-    let cl = unsafe { &*(cl_ptr as *const TensorNode<WgpuBackend>) };
-    Box::into_raw(Box::new(WgpuBackend::paged_attention(q, k, v, kv, bt, cl))) as CTensor
-}
-
-/// Executes a TopK selection for routing.
-///
-/// # Safety
-/// `a_ptr` must be a valid `CTensor` pointer.
-/// `out_vals` and `out_idxs` must be valid, writable pointers to receive the resulting `CTensor` pointers.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_topk(
-    a_ptr: CTensor,
+    a: CTensor,
     k: usize,
     out_vals: *mut CTensor,
     out_idxs: *mut CTensor,
 ) {
-    let a = unsafe { &*(a_ptr as *const TensorNode<WgpuBackend>) };
-    let (vals, idxs) = WgpuBackend::topk(a, k);
     unsafe {
-        *out_vals = Box::into_raw(Box::new(vals)) as CTensor;
-        *out_idxs = Box::into_raw(Box::new(idxs)) as CTensor;
+        let (values, indices) = WgpuBackend::topk(as_node(a), k);
+        *out_vals = into_raw(values);
+        *out_idxs = into_raw(indices);
     }
 }
 
-// LOSS FUNCTIONS
+// ==============================================================================
+// REGULARIZATION & TRAINING OPS
+// ==============================================================================
 
-/// Computes the Cross Entropy Loss.
-///
-/// # Safety
-/// `l_ptr` must be a valid `CTensor` pointer.
-/// `targets_ptr` must point to a valid, contiguous array of `rows * cols` elements of type `c_float`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn clove_cross_entropy(
-    l_ptr: CTensor,
-    targets_ptr: *const c_float,
-    rows: usize,
-    cols: usize,
-) -> CTensor {
-    let l = unsafe { &*(l_ptr as *const TensorNode<WgpuBackend>) };
-    let slice = unsafe { std::slice::from_raw_parts(targets_ptr, rows * cols) };
-    let t_array = Array2::from_shape_vec((rows, cols), slice.to_vec()).unwrap();
-    Box::into_raw(Box::new(WgpuBackend::cross_entropy(l, &t_array))) as CTensor
+pub unsafe extern "C" fn clove_dropout(a: CTensor, rate: c_float) -> CTensor {
+    unsafe { into_raw(WgpuBackend::dropout(as_node(a), rate)) }
 }
 
-/// Computes the Mean Squared Error (MSE) Loss.
-///
-/// # Safety
-/// `p_ptr` must be a valid `CTensor` pointer.
-/// `targets_ptr` must point to a valid, contiguous array of `rows * cols` elements of type `c_float`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_cast(a: CTensor, precision: c_int) -> CTensor {
+    unsafe {
+        let p = match precision {
+            16 => Precision::F16,
+            160 => Precision::BF16,
+            _ => Precision::F32,
+        };
+        into_raw(WgpuBackend::cast(as_node(a), p))
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_batch_norm(
+    x: CTensor,
+    g: CTensor,
+    b: CTensor,
+    rm: CTensor,
+    rv: CTensor,
+    momentum: c_float,
+) -> CTensor {
+    unsafe {
+        into_raw(WgpuBackend::batch_norm(
+            as_node(x),
+            as_node(g),
+            as_node(b),
+            as_node(rm),
+            as_node(rv),
+            momentum,
+        ))
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_all_reduce(a: CTensor) -> CTensor {
+    unsafe { into_raw(WgpuBackend::all_reduce(as_node(a))) }
+}
+
+// ==============================================================================
+// LOSS FUNCTIONS & AUTOGRAD
+// ==============================================================================
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_mse(
-    p_ptr: CTensor,
+    p: CTensor,
     targets_ptr: *const c_float,
     rows: usize,
     cols: usize,
 ) -> CTensor {
-    let p = unsafe { &*(p_ptr as *const TensorNode<WgpuBackend>) };
-    let slice = unsafe { std::slice::from_raw_parts(targets_ptr, rows * cols) };
-    let t_array = Array2::from_shape_vec((rows, cols), slice.to_vec()).unwrap();
-    Box::into_raw(Box::new(WgpuBackend::mse(p, &t_array))) as CTensor
+    unsafe {
+        let targets = ptr_to_array2(targets_ptr, rows, cols);
+        into_raw(WgpuBackend::mse(as_node(p), &targets))
+    }
 }
 
-/// Computes the Huber Loss.
-///
-/// # Safety
-/// `p_ptr` must be a valid `CTensor` pointer.
-/// `targets_ptr` must point to a valid, contiguous array of `rows * cols` elements of type `c_float`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_cross_entropy(
+    l: CTensor,
+    targets_ptr: *const c_float,
+    rows: usize,
+    cols: usize,
+) -> CTensor {
+    unsafe {
+        let targets = ptr_to_array2(targets_ptr, rows, cols);
+        into_raw(WgpuBackend::cross_entropy(as_node(l), &targets))
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_huber_loss(
-    p_ptr: CTensor,
+    p: CTensor,
     targets_ptr: *const c_float,
     rows: usize,
     cols: usize,
     delta: c_float,
 ) -> CTensor {
-    let p = unsafe { &*(p_ptr as *const TensorNode<WgpuBackend>) };
-    let slice = unsafe { std::slice::from_raw_parts(targets_ptr, rows * cols) };
-    let t_array = Array2::from_shape_vec((rows, cols), slice.to_vec()).unwrap();
-    Box::into_raw(Box::new(WgpuBackend::huber_loss(p, &t_array, delta))) as CTensor
+    unsafe {
+        let targets = ptr_to_array2(targets_ptr, rows, cols);
+        into_raw(WgpuBackend::huber_loss(as_node(p), &targets, delta))
+    }
 }
 
-/// Computes the Binary Cross Entropy with Logits Loss.
-///
-/// # Safety
-/// `p_ptr` must be a valid `CTensor` pointer.
-/// `targets_ptr` must point to a valid, contiguous array of `rows * cols` elements of type `c_float`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_bce_with_logits(
-    p_ptr: CTensor,
+    p: CTensor,
     targets_ptr: *const c_float,
     rows: usize,
     cols: usize,
 ) -> CTensor {
-    let p = unsafe { &*(p_ptr as *const TensorNode<WgpuBackend>) };
-    let slice = unsafe { std::slice::from_raw_parts(targets_ptr, rows * cols) };
-    let t_array = Array2::from_shape_vec((rows, cols), slice.to_vec()).unwrap();
-    Box::into_raw(Box::new(WgpuBackend::bce_with_logits(p, &t_array))) as CTensor
+    unsafe {
+        let targets = ptr_to_array2(targets_ptr, rows, cols);
+        into_raw(WgpuBackend::bce_with_logits(as_node(p), &targets))
+    }
 }
 
-// AUTOGRAD & OPTIMIZER
-
-/// Triggers the backward pass (autograd).
-///
-/// # Safety
-/// `tensor_ptr` must be a valid `CTensor` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_backward(tensor_ptr: CTensor) {
-    if tensor_ptr.is_null() {
-        return;
+    unsafe {
+        if !tensor_ptr.is_null() {
+            TensorGraph::<WgpuBackend>::backward(as_node(tensor_ptr));
+        }
     }
-    let tensor = unsafe { &*(tensor_ptr as *const TensorNode<WgpuBackend>) };
-    crate::tensor::TensorGraph::backward(tensor);
 }
 
-/// Creates a GPU-Accelerated AdamW Optimizer.
-///
-/// # Safety
-/// `params_array` must point to a valid, contiguous array of `num_params` elements of type `CTensor`.
+// ==============================================================================
+// OPTIMIZERS & AMP
+// ==============================================================================
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_optimizer_create(
     lr: c_float,
     params_array: *const CTensor,
     num_params: usize,
 ) -> COptimizer {
-    let ptrs = unsafe { std::slice::from_raw_parts(params_array, num_params) };
-    let mut params = Vec::new();
-    for &ptr in ptrs {
-        if !ptr.is_null() {
-            let node = unsafe { &*(ptr as *const TensorNode<WgpuBackend>) };
-            params.push(node.clone());
+    unsafe {
+        let ptrs = std::slice::from_raw_parts(params_array, num_params);
+        let mut params = Vec::new();
+        for &ptr in ptrs {
+            if !ptr.is_null() {
+                params.push(as_node(ptr).clone());
+            }
         }
+        into_raw(AdamW::new(lr, params)) as COptimizer
     }
-
-    let opt = AdamW::new(lr, params);
-    Box::into_raw(Box::new(opt)) as COptimizer
 }
 
-/// Executes a single gradient descent step on the GPU.
-///
-/// # Safety
-/// `opt_ptr` must be a valid `COptimizer` pointer created by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_optimizer_step(opt_ptr: COptimizer) {
-    if opt_ptr.is_null() {
-        return;
+    unsafe {
+        if !opt_ptr.is_null() {
+            let opt = &mut *(opt_ptr as *mut AdamW);
+            opt.step();
+        }
     }
-    let opt = unsafe { &mut *(opt_ptr as *mut AdamW) };
-    opt.step();
 }
 
-/// Zeros the gradients of all parameters held by the optimizer.
-///
-/// # Safety
-/// `opt_ptr` must be a valid `COptimizer` pointer created by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_optimizer_zero_grad(opt_ptr: COptimizer) {
-    if opt_ptr.is_null() {
-        return;
+    unsafe {
+        if !opt_ptr.is_null() {
+            let opt = &mut *(opt_ptr as *mut AdamW);
+            opt.zero_grad();
+        }
     }
-    let opt = unsafe { &mut *(opt_ptr as *mut AdamW) };
-    opt.zero_grad();
 }
 
-/// Frees the Optimizer memory.
-///
-/// # Safety
-/// `opt_ptr` must be a valid `COptimizer` pointer created by this library. Double-freeing results in undefined behavior.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_optimizer_free(opt_ptr: COptimizer) {
-    if !opt_ptr.is_null() {
-        unsafe {
+    unsafe {
+        if !opt_ptr.is_null() {
             let _ = Box::from_raw(opt_ptr as *mut AdamW);
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_grad_scaler_create() -> CGradScaler {
+    // GradScaler creation is safe, no unsafe block needed
+    into_raw(GradScaler::new()) as CGradScaler
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_grad_scaler_scale(
+    scaler_ptr: CGradScaler,
+    loss: c_float,
+) -> c_float {
+    unsafe {
+        if scaler_ptr.is_null() {
+            return loss;
+        }
+        let scaler = &*(scaler_ptr as *const GradScaler);
+        scaler.scale(loss)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_grad_scaler_step(
+    scaler_ptr: CGradScaler,
+    opt_ptr: COptimizer,
+    has_nans: bool,
+) {
+    unsafe {
+        if !scaler_ptr.is_null() && !opt_ptr.is_null() {
+            let scaler = &mut *(scaler_ptr as *mut GradScaler);
+            let opt = &mut *(opt_ptr as *mut AdamW);
+            scaler.step(opt, has_nans);
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_grad_scaler_free(scaler_ptr: CGradScaler) {
+    unsafe {
+        if !scaler_ptr.is_null() {
+            let _ = Box::from_raw(scaler_ptr as *mut GradScaler);
+        }
+    }
+}
+
+// ==============================================================================
+// HIGH-LEVEL MODULES (LANGUAGE MODEL)
+// ==============================================================================
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_nn_language_model_create(
+    vocab_size: usize,
+    hidden_dim: usize,
+    num_layers: usize,
+    num_heads: usize,
+) -> CModel {
+    let model = LanguageModel::<WgpuBackend>::new(vocab_size, hidden_dim, num_layers, num_heads);
+    into_raw(model) as CModel
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_nn_language_model_forward(
+    model_ptr: CModel,
+    indices_ptr: *const c_float,
+    rows: usize,
+    cols: usize,
+) -> CTensor {
+    unsafe {
+        if model_ptr.is_null() {
+            return std::ptr::null_mut();
+        }
+        let model = &*(model_ptr as *const LanguageModel<WgpuBackend>);
+        let indices = ptr_to_array2(indices_ptr, rows, cols);
+        into_raw(model.forward(&indices)) as CTensor
+    }
+}
+
+/// Fetches the model parameters. If `out_ptrs` is null, it simply returns the total count
+/// so the caller can allocate a pointer array. If `out_ptrs` is valid, it populates it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_nn_language_model_parameters(
+    model_ptr: CModel,
+    out_ptrs: *mut CTensor,
+) -> usize {
+    unsafe {
+        if model_ptr.is_null() {
+            return 0;
+        }
+        let model = &*(model_ptr as *const LanguageModel<WgpuBackend>);
+        let params = model.parameters();
+
+        // Save the length BEFORE we consume the vector in the loop!
+        let count = params.len();
+
+        if !out_ptrs.is_null() {
+            let out_slice = std::slice::from_raw_parts_mut(out_ptrs, count);
+            for (i, p) in params.into_iter().enumerate() {
+                out_slice[i] = into_raw(p) as CTensor;
+            }
+        }
+
+        count
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_nn_language_model_save(
+    model_ptr: CModel,
+    path: *const c_char,
+) -> bool {
+    unsafe {
+        if model_ptr.is_null() || path.is_null() {
+            return false;
+        }
+        let model = &*(model_ptr as *const LanguageModel<WgpuBackend>);
+        if let Ok(str_path) = CStr::from_ptr(path).to_str() {
+            model.save_safetensors(str_path).is_ok()
+        } else {
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_nn_language_model_load(
+    model_ptr: CModel,
+    path: *const c_char,
+) -> bool {
+    unsafe {
+        if model_ptr.is_null() || path.is_null() {
+            return false;
+        }
+        let model = &*(model_ptr as *const LanguageModel<WgpuBackend>);
+        if let Ok(str_path) = CStr::from_ptr(path).to_str() {
+            model.load_safetensors(str_path).is_ok()
+        } else {
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_nn_language_model_free(model_ptr: CModel) {
+    unsafe {
+        if !model_ptr.is_null() {
+            let _ = Box::from_raw(model_ptr as *mut LanguageModel<WgpuBackend>);
+        }
+    }
+}
+
+// ==============================================================================
+// ASYNCHRONOUS DATA LOADER
+// ==============================================================================
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_dataloader_create(
+    path: *const c_char,
+    seq_len: usize,
+    batch_size: usize,
+) -> CDataLoader {
+    unsafe {
+        if path.is_null() {
+            return std::ptr::null_mut();
+        }
+        if let Ok(str_path) = CStr::from_ptr(path).to_str() {
+            // Bypass DataPipeline setup here for simplicity across C-ABI
+            let loader = DataLoader::from_file(str_path, seq_len, batch_size, None);
+            into_raw(loader) as CDataLoader
+        } else {
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_dataloader_next(
+    loader_ptr: CDataLoader,
+    out_x: *mut CTensor,
+    out_y: *mut CTensor,
+) {
+    unsafe {
+        if loader_ptr.is_null() || out_x.is_null() || out_y.is_null() {
+            return;
+        }
+        let loader = &mut *(loader_ptr as *mut DataLoader);
+        let (x, y) = loader.next_batch();
+        *out_x = into_raw(WgpuBackend::new(x)) as CTensor;
+        *out_y = into_raw(WgpuBackend::new(y)) as CTensor;
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clove_dataloader_free(loader_ptr: CDataLoader) {
+    unsafe {
+        if !loader_ptr.is_null() {
+            let _ = Box::from_raw(loader_ptr as *mut DataLoader);
         }
     }
 }

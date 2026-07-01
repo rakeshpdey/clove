@@ -5,6 +5,22 @@ All notable changes to the Clove framework will be documented in this file.
 The format is based on Keep a Changelog,
 and this project adheres to Semantic Versioning.
 
+[0.1.3] - 2026-07-01
+
+Added
+
+Universal C-ABI Gateway (ffi.rs): Exposed high-level modules including LanguageModel, DataLoader, GradScaler, and AdamW for Python/Julia/Go interoperability.
+
+JIT Compiler Optimizations: Implemented true Algebraic Constant Folding and injected the TopK WGSL compute shader for Mixture-of-Experts routing.
+
+Dynamic Memory Mapping: PagedAttention now dynamically parses head_dim directly from the tensor shape at runtime.
+
+Fixed
+
+FFI Routing: Bypassed TensorGraph wrapper limitations by mapping FFI math operations directly to <WgpuBackend>.
+
+Thread Safety: Implemented Drop trait on DataLoader to safely join asynchronous background pre-fetching threads and prevent memory leaks.
+
 [0.1.2] - 2026-06-30
 
 Added
