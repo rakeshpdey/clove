@@ -5,6 +5,20 @@ All notable changes to the Clove framework will be documented in this file.
 The format is based on Keep a Changelog,
 and this project adheres to Semantic Versioning.
 
+[0.1.4] - 2026-07-02
+
+Added
+
+Implemented core matrix multiplication optimization for matmul routine.
+Added comprehensive unit tests for edge-case dimensions in linear algebra module.
+
+Fixed
+
+Resolved segmentation fault in memory-aligned buffer allocation.
+Corrected off-by-one error in tiling cache logic.
+
+
+
 [0.1.3] - 2026-07-01
 
 Added

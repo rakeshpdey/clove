@@ -1282,12 +1282,18 @@ impl Backend for WgpuBackend {
     fn matmul(a_node: &TensorNode<Self>, b_node: &TensorNode<Self>) -> TensorNode<Self> {
         let a = a_node.read().unwrap();
         let b = b_node.read().unwrap();
-        let last_idx = a.shape.len() - 1;
-        let m: usize = a.shape[0..last_idx].iter().product();
-        let k = *a.shape.last().unwrap();
-        let n = b.shape[1];
+
+        let k = *a.shape.last().unwrap_or(&1);
+
+        let a_vol: usize = a.shape.iter().product();
+        let b_vol: usize = b.shape.iter().product();
+
+        let m = a_vol.checked_div(k).unwrap_or(0);
+        let n = b_vol.checked_div(k).unwrap_or(0);
+
         let mut out_shape = a.shape.clone();
-        out_shape[last_idx] = n;
+        let a_last_idx = a.shape.len().saturating_sub(1);
+        out_shape[a_last_idx] = n;
 
         let out_data = match (&a.data, &b.data) {
             (TensorData::Cpu(a_vec), TensorData::Cpu(b_vec)) => {
