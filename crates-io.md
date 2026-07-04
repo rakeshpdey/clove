@@ -4,11 +4,9 @@ Clove is a high-performance machine learning and deep learning framework. Design
 
 Quick Links
 
-View Source on GitHub
-
-Report Issues / Request Features
-
-API Documentation
+* [**View Source on GitHub**](https://github.com/rakeshpdey/clove)
+* [**Report Issues / Request Features**](https://github.com/rakeshpdey/clove/issues)
+* [**API Documentation**](https://docs.rs/clove)
 
 Quick Start
 
@@ -51,16 +49,6 @@ Hardware: Vulkan, Metal, or DX12 compliant drivers for GPU acceleration.
 Contributing
 
 We welcome community contributions. Please ensure that all new operations include corresponding WGSL shader implementations in backend.rs and appropriate test coverage.
-
-How to get started:
-
-Find a task: Check the Issue Tracker for issues labeled good first issue or help wanted.
-
-Setup: Fork the repository and create a new feature branch.
-
-Contribute: Make your changes, test them, and submit a Pull Request with a clear description of what you've done.
-
-Questions: Not sure where to start? Feel free to open a new issue to discuss your ideas before diving into the code!
 
 Status
 
