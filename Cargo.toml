@@ -1,13 +1,13 @@
 [package]
 name = "clove"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
-description = "A high-performance, hardware-agnostic Machine Learning framework written purely in Rust."
+description = "A hardware-agnostic Machine Learning and Deep Learning framework featuring a native C-ABI."
 license = "MIT"
 repository = "https://github.com/rakeshpdey/clove"
-readme = "README.md"
-keywords = ["machine-learning", "neural-network", "webgpu", "tensor"]
-categories = ["science", "mathematics", "wasm"]
+readme = "crates-io.md"
+keywords = ["machine-learning", "deep-learning", "neural-network", "webgpu", "tensor"]
+categories = ["science", "mathematics"]
 exclude = ["data/**"]
 
 [dependencies]

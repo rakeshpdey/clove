@@ -1,6 +1,6 @@
 # Clove
 
-Clove is a high-performance machine learning framework. Designed for both scale-out cluster training and edge-native inference, it leverages hardware acceleration via wgpu, lazy evaluation for kernel fusion, and a robust tape-based autograd engine.
+Clove is a high-performance machine learning and deep learning framework. Designed for both scale-out cluster training and edge-native inference, it leverages hardware acceleration via wgpu, lazy evaluation for kernel fusion, and a robust tape-based autograd engine.
 
 ## Core Architecture
 
