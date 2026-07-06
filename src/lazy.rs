@@ -628,6 +628,9 @@ impl Backend for LazyBackend {
     }
 
     fn dropout(a: &TensorNode<Self>, rate: f32) -> TensorNode<Self> {
+        if rate <= 0.0 {
+            return a.clone();
+        }
         let a_id = Self::get_id(a);
         let sym_shape = GLOBAL_GRAPH.with(|g| g.borrow().nodes[a_id].shape.clone());
         let id = GLOBAL_GRAPH.with(|g| {

@@ -168,6 +168,9 @@ impl<B: Backend> TensorGraph<B> {
         B::layer_norm(a, gamma, beta)
     }
     pub fn dropout(a: &TensorNode<B>, rate: f32) -> TensorNode<B> {
+        if rate <= 0.0 {
+            return a.clone();
+        }
         B::dropout(a, rate)
     }
     pub fn conv2d(i: &TensorNode<B>, k: &TensorNode<B>) -> TensorNode<B> {

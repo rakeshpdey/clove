@@ -26,9 +26,7 @@ use ndarray::Array2;
 use std::ffi::{CStr, c_void};
 use std::os::raw::{c_char, c_float, c_int};
 
-// ==============================================================================
 // OPAQUE POINTER TYPES
-// ==============================================================================
 // These type aliases create strongly-typed opaque pointers for the C-ABI.
 // Foreign languages will hold these pointers without knowing their Rust internals.
 
@@ -38,9 +36,7 @@ pub type CGradScaler = *mut c_void;
 pub type CModel = *mut c_void;
 pub type CDataLoader = *mut c_void;
 
-// ==============================================================================
-// INTERNAL FFI HELPERS (Rust 2024 Compliant)
-// ==============================================================================
+// INTERNAL FFI HELPERS
 
 /// Safely casts a raw C pointer back into a Rust TensorNode reference.
 #[inline(always)]
@@ -64,9 +60,7 @@ unsafe fn ptr_to_array2(ptr: *const c_float, rows: usize, cols: usize) -> Array2
     }
 }
 
-// ==============================================================================
 // TENSOR LIFECYCLE & MEMORY
-// ==============================================================================
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_tensor_create(
@@ -90,7 +84,6 @@ pub unsafe extern "C" fn clove_tensor_create(
 pub unsafe extern "C" fn clove_tensor_free(tensor_ptr: CTensor) {
     unsafe {
         if !tensor_ptr.is_null() {
-            // Re-take ownership to drop and free memory
             let _ = Box::from_raw(tensor_ptr as *mut Node);
         }
     }
@@ -112,9 +105,7 @@ pub unsafe extern "C" fn clove_tensor_data(tensor_ptr: CTensor, out_data: *mut c
     }
 }
 
-// ==============================================================================
 // CORE MATH & SHAPE LOGIC
-// ==============================================================================
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_add(a: CTensor, b: CTensor) -> CTensor {
@@ -156,9 +147,7 @@ pub unsafe extern "C" fn clove_concat(a: CTensor, b: CTensor) -> CTensor {
     unsafe { into_raw(WgpuBackend::concat_seq(as_node(a), as_node(b))) }
 }
 
-// ==============================================================================
 // ACTIVATIONS & TRIGONOMETRY
-// ==============================================================================
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_relu(a: CTensor) -> CTensor {
@@ -195,9 +184,7 @@ pub unsafe extern "C" fn clove_cos(a: CTensor) -> CTensor {
     unsafe { into_raw(WgpuBackend::cos(as_node(a))) }
 }
 
-// ==============================================================================
 // VISION (CNNs) & POOLING
-// ==============================================================================
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_conv1d(i: CTensor, k: CTensor) -> CTensor {
@@ -224,9 +211,7 @@ pub unsafe extern "C" fn clove_avg_pool2d(a: CTensor, kernel: usize) -> CTensor 
     unsafe { into_raw(WgpuBackend::avg_pool2d(as_node(a), kernel)) }
 }
 
-// ==============================================================================
 // LLMs, ATTENTION, & NLP
-// ==============================================================================
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_layer_norm(a: CTensor, gamma: CTensor, beta: CTensor) -> CTensor {
@@ -292,9 +277,7 @@ pub unsafe extern "C" fn clove_topk(
     }
 }
 
-// ==============================================================================
 // REGULARIZATION & TRAINING OPS
-// ==============================================================================
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_dropout(a: CTensor, rate: c_float) -> CTensor {
@@ -339,9 +322,7 @@ pub unsafe extern "C" fn clove_all_reduce(a: CTensor) -> CTensor {
     unsafe { into_raw(WgpuBackend::all_reduce(as_node(a))) }
 }
 
-// ==============================================================================
 // LOSS FUNCTIONS & AUTOGRAD
-// ==============================================================================
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_mse(
@@ -405,9 +386,7 @@ pub unsafe extern "C" fn clove_backward(tensor_ptr: CTensor) {
     }
 }
 
-// ==============================================================================
 // OPTIMIZERS & AMP
-// ==============================================================================
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_optimizer_create(
@@ -458,7 +437,6 @@ pub unsafe extern "C" fn clove_optimizer_free(opt_ptr: COptimizer) {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_grad_scaler_create() -> CGradScaler {
-    // GradScaler creation is safe, no unsafe block needed
     into_raw(GradScaler::new()) as CGradScaler
 }
 
@@ -500,9 +478,7 @@ pub unsafe extern "C" fn clove_grad_scaler_free(scaler_ptr: CGradScaler) {
     }
 }
 
-// ==============================================================================
 // HIGH-LEVEL MODULES (LANGUAGE MODEL)
-// ==============================================================================
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_nn_language_model_create(
@@ -605,9 +581,7 @@ pub unsafe extern "C" fn clove_nn_language_model_free(model_ptr: CModel) {
     }
 }
 
-// ==============================================================================
 // ASYNCHRONOUS DATA LOADER
-// ==============================================================================
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clove_dataloader_create(
@@ -620,7 +594,6 @@ pub unsafe extern "C" fn clove_dataloader_create(
             return std::ptr::null_mut();
         }
         if let Ok(str_path) = CStr::from_ptr(path).to_str() {
-            // Bypass DataPipeline setup here for simplicity across C-ABI
             let loader = DataLoader::from_file(str_path, seq_len, batch_size, None);
             into_raw(loader) as CDataLoader
         } else {

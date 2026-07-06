@@ -2191,6 +2191,9 @@ impl Backend for WgpuBackend {
     }
 
     fn dropout(node: &TensorNode<Self>, rate: f32) -> TensorNode<Self> {
+        if rate <= 0.0 {
+            return node.clone();
+        }
         let a = node.read().unwrap();
         let out_data = match &a.data {
             TensorData::Cpu(a_data) => {
