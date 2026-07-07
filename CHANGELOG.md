@@ -5,6 +5,12 @@ All notable changes to the Clove framework will be documented in this file.
 The format is based on Keep a Changelog,
 and this project adheres to Semantic Versioning.
 
+[0.1.7] - 2026-07-07
+
+Fixed
+
+update matmul,transpose,cross-entropy,rope,softmax
+
 [0.1.6] - 2026-07-06
 
 Fixed

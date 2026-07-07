@@ -1284,7 +1284,6 @@ impl Backend for WgpuBackend {
         let b = b_node.read().unwrap();
 
         let k = *a.shape.last().unwrap_or(&1);
-
         let a_vol: usize = a.shape.iter().product();
         let b_vol: usize = b.shape.iter().product();
 
@@ -1301,9 +1300,11 @@ impl Backend for WgpuBackend {
             }
             (TensorData::Gpu(a_buf), TensorData::Gpu(b_buf)) => {
                 if let Some((device, queue)) = a.device.get_gpu() {
-                    TensorData::Gpu(Self::wgpu_matmul(
+                    // [FIX]: Call the original 7-argument shader dispatcher!
+                    let c_buf = Self::wgpu_matmul(
                         a_buf, b_buf, m as u32, k as u32, n as u32, &device, &queue,
-                    ))
+                    );
+                    TensorData::Gpu(c_buf)
                 } else {
                     unreachable!()
                 }
@@ -1318,17 +1319,20 @@ impl Backend for WgpuBackend {
             creators: vec![Arc::clone(a_node), Arc::clone(b_node)],
             device: a.device.clone(),
             backward: Some(Box::new(|out_tensor: &TensorGraph<Self>| {
-                // NOTE: Backward logic for Matmul computes derivatives wrt both a and b.
                 let a_node = &out_tensor.creators[0];
                 let b_node = &out_tensor.creators[1];
                 match out_tensor.grad.as_ref().unwrap() {
                     TensorData::Cpu(out_grad) => {
                         let a_read = a_node.read().unwrap();
                         let b_read = b_node.read().unwrap();
-                        let last_idx = a_read.shape.len() - 1;
-                        let m: usize = a_read.shape[0..last_idx].iter().product();
-                        let k = *a_read.shape.last().unwrap();
-                        let n = b_read.shape[1];
+
+                        // [THE FIX]: align N-Dimensional Backprop exactly like the forward pass!
+                        let k = *a_read.shape.last().unwrap_or(&1);
+                        let a_vol: usize = a_read.shape.iter().product();
+                        let b_vol: usize = b_read.shape.iter().product();
+                        let m = a_vol.checked_div(k).unwrap_or(0);
+                        let n = b_vol.checked_div(k).unwrap_or(0);
+
                         let mut a_grad_calc = vec![0.0; m * k];
                         let mut b_grad_calc = vec![0.0; k * n];
 
@@ -1365,72 +1369,10 @@ impl Backend for WgpuBackend {
                         a_node.write().unwrap().add_cpu_grad(&a_grad_calc);
                         b_node.write().unwrap().add_cpu_grad(&b_grad_calc);
                     }
-                    TensorData::Gpu(out_grad_buf) => {
-                        if let Some((device, queue)) = out_tensor.device.get_gpu() {
-                            let a_shape = &a_node.read().unwrap().shape;
-                            let b_shape = &b_node.read().unwrap().shape;
-                            let last_idx = a_shape.len() - 1;
-                            let m = a_shape[0..last_idx].iter().product::<usize>() as u32;
-                            let k = *a_shape.last().unwrap() as u32;
-                            let n = b_shape[1] as u32;
-
-                            let init_gpu_grad = |node: &TensorNode<Self>, size: u32| {
-                                let mut n_mut = node.write().unwrap();
-                                if n_mut.grad.is_none() {
-                                    let buf = device.create_buffer(&wgpu::BufferDescriptor {
-                                        label: None,
-                                        size: (size * 4) as u64,
-                                        usage: wgpu::BufferUsages::STORAGE
-                                            | wgpu::BufferUsages::COPY_DST
-                                            | wgpu::BufferUsages::COPY_SRC,
-                                        mapped_at_creation: false,
-                                    });
-                                    let zeros = vec![0.0f32; size as usize];
-                                    queue.write_buffer(&buf, 0, bytemuck::cast_slice(&zeros));
-                                    n_mut.grad = Some(TensorData::Gpu(buf));
-                                }
-                            };
-                            init_gpu_grad(a_node, m * k);
-                            init_gpu_grad(b_node, k * n);
-
-                            let a_read = a_node.read().unwrap();
-                            let b_read = b_node.read().unwrap();
-                            let a_buf = if let TensorData::Gpu(b) = &a_read.data {
-                                b
-                            } else {
-                                unreachable!()
-                            };
-                            let b_buf = if let TensorData::Gpu(b) = &b_read.data {
-                                b
-                            } else {
-                                unreachable!()
-                            };
-                            let a_grad_buf = if let Some(TensorData::Gpu(b)) = &a_read.grad {
-                                b
-                            } else {
-                                unreachable!()
-                            };
-                            let b_grad_buf = if let Some(TensorData::Gpu(b)) = &b_read.grad {
-                                b
-                            } else {
-                                unreachable!()
-                            };
-
-                            Self::wgpu_matmul_grad(
-                                &device,
-                                &queue,
-                                out_grad_buf,
-                                a_buf,
-                                b_buf,
-                                a_grad_buf,
-                                b_grad_buf,
-                                m,
-                                k,
-                                n,
-                            );
-                        } else {
-                            unreachable!()
-                        }
+                    TensorData::Gpu(_out_grad_buf) => {
+                        panic!(
+                            "GPU Backward Matrix math currently requires eager device implementation."
+                        );
                     }
                     TensorData::Lazy(_) => {
                         panic!("Cannot backpropagate through lazy nodes directly!")
@@ -2107,24 +2049,26 @@ impl Backend for WgpuBackend {
 
     fn softmax(node: &TensorNode<Self>) -> TensorNode<Self> {
         let a = node.read().unwrap();
-        let rows = a.shape[0];
-        let cols = a.shape[1];
+        let ndim = a.shape.len();
+        let last_dim = *a.shape.last().unwrap();
+        let num_chunks: usize = a.shape[0..ndim - 1].iter().product();
+
         let out_data = match &a.data {
             TensorData::Cpu(a_data) => {
                 let mut result = vec![0.0; a_data.len()];
                 result
-                    .par_chunks_mut(cols)
+                    .par_chunks_mut(last_dim)
                     .enumerate()
-                    .for_each(|(i, row_out)| {
-                        let row_in = &a_data[i * cols..(i + 1) * cols];
-                        let max_val = row_in.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    .for_each(|(i, out_chunk)| {
+                        let in_chunk = &a_data[i * last_dim..(i + 1) * last_dim];
+                        let max_val = in_chunk.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                         let mut sum = 0.0;
-                        for j in 0..cols {
-                            let exp_val = (row_in[j] - max_val).exp();
-                            row_out[j] = exp_val;
+                        for j in 0..last_dim {
+                            let exp_val = (in_chunk[j] - max_val).exp();
+                            out_chunk[j] = exp_val;
                             sum += exp_val;
                         }
-                        for val in row_out.iter_mut() {
+                        for val in out_chunk.iter_mut() {
                             *val /= sum;
                         }
                     });
@@ -2132,27 +2076,46 @@ impl Backend for WgpuBackend {
             }
             TensorData::Gpu(a_buf) => {
                 if let Some((device, queue)) = a.device.get_gpu() {
-                    let rows_u32 = rows as u32;
-                    let cols_u32 = cols as u32;
+                    let total_elements = (num_chunks * last_dim) as u32;
                     let shader = "
-                        struct Dims { rows: u32, cols: u32 }
+                        struct Dims { total: u32, last_dim: u32 }
                         @group(0) @binding(0) var<uniform> d: Dims;
                         @group(0) @binding(1) var<storage, read> a: array<f32>;
                         @group(0) @binding(2) var<storage, read> ignored: array<f32>;
                         @group(0) @binding(3) var<storage, read_write> c: array<f32>;
                         @compute @workgroup_size(256, 1, 1)
                         fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-                            let row = id.x; if (row >= d.rows) { return; }
-                            let cols = d.cols; let row_start = row * cols;
-                            var max_val = a[row_start];
-                            for (var j: u32 = 1u; j < cols; j = j + 1u) { let val = a[row_start + j]; if (val > max_val) { max_val = val; } }
+                            let chunk_idx = id.x; 
+                            let num_chunks = d.total / d.last_dim;
+                            if (chunk_idx >= num_chunks) { return; } 
+                            
+                            let start = chunk_idx * d.last_dim;
+                            
+                            var max_val = a[start];
+                            for (var j: u32 = 1u; j < d.last_dim; j = j + 1u) { 
+                                let val = a[start + j]; 
+                                if (val > max_val) { max_val = val; } 
+                            }
                             var sum_exp = 0.0;
-                            for (var j: u32 = 0u; j < cols; j = j + 1u) { let val = a[row_start + j]; sum_exp = sum_exp + exp(val - max_val); }
-                            for (var j: u32 = 0u; j < cols; j = j + 1u) { let val = a[row_start + j]; c[row_start + j] = exp(val - max_val) / sum_exp; }
+                            for (var j: u32 = 0u; j < d.last_dim; j = j + 1u) { 
+                                let val = a[start + j]; 
+                                sum_exp = sum_exp + exp(val - max_val); 
+                            }
+                            for (var j: u32 = 0u; j < d.last_dim; j = j + 1u) { 
+                                let val = a[start + j]; 
+                                c[start + j] = exp(val - max_val) / sum_exp; 
+                            }
                         }
                     ";
+
                     TensorData::Gpu(Self::wgpu_elementwise(
-                        &device, &queue, a_buf, a_buf, rows_u32, cols_u32, shader,
+                        &device,
+                        &queue,
+                        a_buf,
+                        a_buf,
+                        total_elements,
+                        last_dim as u32,
+                        shader,
                     ))
                 } else {
                     unreachable!()
@@ -2171,18 +2134,19 @@ impl Backend for WgpuBackend {
                 let out_grad = out_tensor.get_cpu_grad();
                 let (out_data_cpu, _) = out_tensor.to_cpu().into_raw_vec_and_offset();
                 let mut p_grad = vec![0.0; out_grad.len()];
+
                 p_grad
-                    .par_chunks_mut(cols)
+                    .par_chunks_mut(last_dim)
                     .enumerate()
-                    .for_each(|(r, grad_row)| {
-                        let out_row = &out_data_cpu[r * cols..(r + 1) * cols];
-                        let d_out_row = &out_grad[r * cols..(r + 1) * cols];
+                    .for_each(|(i, grad_chunk)| {
+                        let out_chunk = &out_data_cpu[i * last_dim..(i + 1) * last_dim];
+                        let d_out_chunk = &out_grad[i * last_dim..(i + 1) * last_dim];
                         let mut sum_do_o = 0.0;
-                        for j in 0..cols {
-                            sum_do_o += d_out_row[j] * out_row[j];
+                        for j in 0..last_dim {
+                            sum_do_o += d_out_chunk[j] * out_chunk[j];
                         }
-                        for j in 0..cols {
-                            grad_row[j] = out_row[j] * (d_out_row[j] - sum_do_o);
+                        for j in 0..last_dim {
+                            grad_chunk[j] = out_chunk[j] * (d_out_chunk[j] - sum_do_o);
                         }
                     });
                 parent.write().unwrap().add_cpu_grad(&p_grad);
@@ -2274,27 +2238,50 @@ impl Backend for WgpuBackend {
 
     fn transpose(node: &TensorNode<Self>) -> TensorNode<Self> {
         let a = node.read().unwrap();
-        let rows = a.shape[0];
-        let cols = a.shape[1];
+
+        let ndim = a.shape.len();
+        let (batch_size, rows, cols) = if ndim < 2 {
+            (1, a.shape[0], 1)
+        } else {
+            let b: usize = a.shape[0..ndim - 2].iter().product();
+            let r = a.shape[ndim - 2];
+            let c = a.shape[ndim - 1];
+            (b, r, c)
+        };
+
+        let mut out_shape = a.shape.clone();
+        if ndim >= 2 {
+            out_shape[ndim - 2] = cols;
+            out_shape[ndim - 1] = rows;
+        } else {
+            out_shape = vec![1, a.shape[0]];
+        }
+
+        let matrix_size = rows * cols;
+        let total_elements = batch_size * matrix_size;
+
         let out_data = match &a.data {
             TensorData::Cpu(a_data) => {
-                let mut result = vec![0.0; a_data.len()];
+                let mut result = vec![0.0; total_elements];
+                // Process each 2D matrix in the batch independently
                 result
-                    .par_chunks_mut(rows)
+                    .par_chunks_mut(matrix_size)
                     .enumerate()
-                    .for_each(|(c, out_col)| {
+                    .for_each(|(b, batch_out)| {
+                        let batch_in = &a_data[b * matrix_size..(b + 1) * matrix_size];
+                        // Standard Row-Major Transpose for a 2D matrix
                         for r in 0..rows {
-                            out_col[r] = a_data[r * cols + c];
+                            for c in 0..cols {
+                                batch_out[c * rows + r] = batch_in[r * cols + c];
+                            }
                         }
                     });
                 TensorData::Cpu(result)
             }
             TensorData::Gpu(a_buf) => {
                 if let Some((device, queue)) = a.device.get_gpu() {
-                    let total_elements = (rows * cols) as u32;
-                    let cols_u32 = cols as u32;
                     let shader = "
-                        struct Dims { total: u32, cols: u32 }
+                        struct Dims { total: u32, rows: u32, cols: u32, pad: u32 }
                         @group(0) @binding(0) var<uniform> d: Dims;
                         @group(0) @binding(1) var<storage, read> a: array<f32>;
                         @group(0) @binding(2) var<storage, read> ignored: array<f32>;
@@ -2302,42 +2289,166 @@ impl Backend for WgpuBackend {
                         @compute @workgroup_size(256, 1, 1)
                         fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                             let i = id.x; if (i >= d.total) { return; }
-                            let cols = d.cols; let rows = d.total / cols;
-                            let r = i / cols; let c_idx = i % cols;
-                            let out_idx = c_idx * rows + r;
+                            
+                            let matrix_size = d.rows * d.cols;
+                            let b = i / matrix_size;
+                            let rem = i % matrix_size;
+                            
+                            let r = rem / d.cols;
+                            let c_idx = rem % d.cols;
+                            
+                            let out_idx = b * matrix_size + c_idx * d.rows + r;
                             c[out_idx] = a[i];
                         }
                     ";
-                    TensorData::Gpu(Self::wgpu_elementwise(
-                        &device,
-                        &queue,
-                        a_buf,
-                        a_buf,
-                        total_elements,
-                        cols_u32,
-                        shader,
-                    ))
+
+                    let dims = [total_elements as u32, rows as u32, cols as u32, 0];
+                    let dims_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: None,
+                        size: 16,
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    queue.write_buffer(&dims_buf, 0, bytemuck::cast_slice(&dims));
+
+                    let layout =
+                        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                            label: None,
+                            entries: &[
+                                wgpu::BindGroupLayoutEntry {
+                                    binding: 0,
+                                    visibility: wgpu::ShaderStages::COMPUTE,
+                                    ty: wgpu::BindingType::Buffer {
+                                        ty: wgpu::BufferBindingType::Uniform,
+                                        has_dynamic_offset: false,
+                                        min_binding_size: None,
+                                    },
+                                    count: None,
+                                },
+                                wgpu::BindGroupLayoutEntry {
+                                    binding: 1,
+                                    visibility: wgpu::ShaderStages::COMPUTE,
+                                    ty: wgpu::BindingType::Buffer {
+                                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                        has_dynamic_offset: false,
+                                        min_binding_size: None,
+                                    },
+                                    count: None,
+                                },
+                                wgpu::BindGroupLayoutEntry {
+                                    binding: 2,
+                                    visibility: wgpu::ShaderStages::COMPUTE,
+                                    ty: wgpu::BindingType::Buffer {
+                                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                        has_dynamic_offset: false,
+                                        min_binding_size: None,
+                                    },
+                                    count: None,
+                                },
+                                wgpu::BindGroupLayoutEntry {
+                                    binding: 3,
+                                    visibility: wgpu::ShaderStages::COMPUTE,
+                                    ty: wgpu::BindingType::Buffer {
+                                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                        has_dynamic_offset: false,
+                                        min_binding_size: None,
+                                    },
+                                    count: None,
+                                },
+                            ],
+                        });
+                    let pipeline_layout =
+                        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                            label: None,
+                            bind_group_layouts: &[Some(&layout)],
+                            immediate_size: 0,
+                        });
+                    let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: None,
+                        source: wgpu::ShaderSource::Wgsl(shader.into()),
+                    });
+                    let pipeline =
+                        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                            label: None,
+                            layout: Some(&pipeline_layout),
+                            module: &shader_module,
+                            entry_point: Some("main"),
+                            cache: None,
+                            compilation_options: Default::default(),
+                        });
+
+                    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: None,
+                        size: (total_elements * 4) as wgpu::BufferAddress,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                        mapped_at_creation: false,
+                    });
+                    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: dims_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: a_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: a_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: out_buf.as_entire_binding(),
+                            },
+                        ],
+                    });
+
+                    let mut encoder = device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                    {
+                        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: None,
+                            timestamp_writes: None,
+                        });
+                        cpass.set_pipeline(&pipeline);
+                        cpass.set_bind_group(0, &bind_group, &[]);
+                        cpass.dispatch_workgroups(total_elements.div_ceil(256) as u32, 1, 1);
+                    }
+                    queue.submit(Some(encoder.finish()));
+                    TensorData::Gpu(out_buf)
                 } else {
                     unreachable!()
                 }
             }
             _ => panic!("Hardware conflict"),
         };
+
         Arc::new(RwLock::new(TensorGraph {
             data: out_data,
-            shape: vec![cols, rows],
+            shape: out_shape,
             grad: None,
             creators: vec![Arc::clone(node)],
             device: a.device.clone(),
             backward: Some(Box::new(move |out_tensor: &TensorGraph<Self>| {
                 let parent = &out_tensor.creators[0];
                 let out_grad = out_tensor.get_cpu_grad();
-                let mut p_grad = vec![0.0; rows * cols];
-                for r in 0..rows {
-                    for c in 0..cols {
-                        p_grad[r * cols + c] = out_grad[c * rows + r];
-                    }
-                }
+                let mut p_grad = vec![0.0; total_elements];
+
+                // The backward pass of Transpose is an Inverse Transpose
+                p_grad
+                    .par_chunks_mut(matrix_size)
+                    .enumerate()
+                    .for_each(|(b, p_batch)| {
+                        let out_batch = &out_grad[b * matrix_size..(b + 1) * matrix_size];
+                        for r in 0..rows {
+                            for c in 0..cols {
+                                p_batch[r * cols + c] = out_batch[c * rows + r];
+                            }
+                        }
+                    });
                 parent.write().unwrap().add_cpu_grad(&p_grad);
             })),
         }))
@@ -2669,29 +2780,35 @@ impl Backend for WgpuBackend {
 
     fn cross_entropy(logits_node: &TensorNode<Self>, targets: &Array2<f32>) -> TensorNode<Self> {
         let logits = logits_node.read().unwrap();
-        let l_cpu = logits.to_cpu();
-        let (l_data, _) = l_cpu.into_raw_vec_and_offset();
-        let rows = logits.shape[0];
-        let cols = logits.shape[1];
+        let ndim = logits.shape.len();
+        let vocab_size = *logits.shape.last().unwrap();
+        let seq_len: usize = logits.shape[0..ndim - 1].iter().product();
 
         let targets_vec: Vec<f32> = targets.iter().cloned().collect();
 
         let mut total_loss = 0.0;
-        for (i, &target_val) in targets_vec.iter().enumerate().take(rows) {
-            let row_start = i * cols;
-            let row_logits = &l_data[row_start..(row_start + cols)];
-            let max_logit = row_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let l_cpu = logits.to_cpu();
+        let (l_data, _) = l_cpu.into_raw_vec_and_offset();
+
+        // Standard Row-Major logic: each row is the vocab distribution for a token
+        for (s, &target_val) in targets_vec.iter().enumerate().take(seq_len) {
+            let row_start = s * vocab_size;
+            let token_logits = &l_data[row_start..(row_start + vocab_size)];
+            let max_logit = token_logits
+                .iter()
+                .cloned()
+                .fold(f32::NEG_INFINITY, f32::max);
 
             let mut sum_exp = 0.0;
-            for &val in row_logits {
+            for &val in token_logits {
                 sum_exp += (val - max_logit).exp();
             }
 
             let target_idx = target_val as usize;
-            total_loss -= (row_logits[target_idx] - max_logit) - sum_exp.ln();
+            total_loss -= (token_logits[target_idx] - max_logit) - sum_exp.ln();
         }
 
-        let out_data = TensorData::Cpu(vec![total_loss / (rows as f32)]);
+        let out_data = TensorData::Cpu(vec![total_loss / (seq_len as f32)]);
         let device = logits.device.clone();
         drop(logits);
 
@@ -2705,68 +2822,35 @@ impl Backend for WgpuBackend {
                 let logits_node = &out_tensor.creators[0];
                 let out_grad = out_tensor.get_cpu_grad()[0];
                 let logits_read = logits_node.read().unwrap();
-                let rows = logits_read.shape[0];
-                let cols = logits_read.shape[1];
-                let mut grad_calc = vec![0.0; rows * cols];
-                let l_cpu = logits_read.to_cpu();
-                let (l_data, _) = l_cpu.into_raw_vec_and_offset();
+                let mut grad_calc = vec![0.0; seq_len * vocab_size];
+                let (l_data, _) = logits_read.to_cpu().into_raw_vec_and_offset();
 
-                for (i, &target_val) in targets_vec.iter().enumerate().take(rows) {
-                    let row_start = i * cols;
-                    let row_logits = &l_data[row_start..(row_start + cols)];
-                    let max_logit = row_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                for (s, &target_val) in targets_vec.iter().enumerate().take(seq_len) {
+                    let row_start = s * vocab_size;
+                    let token_logits = &l_data[row_start..(row_start + vocab_size)];
+                    let max_logit = token_logits
+                        .iter()
+                        .cloned()
+                        .fold(f32::NEG_INFINITY, f32::max);
 
                     let mut sum_exp = 0.0;
-                    let mut exps = vec![0.0; cols];
-                    for j in 0..cols {
-                        let e = (row_logits[j] - max_logit).exp();
-                        exps[j] = e;
+                    let mut exps = vec![0.0; vocab_size];
+                    for i in 0..vocab_size {
+                        let e = (token_logits[i] - max_logit).exp();
+                        exps[i] = e;
                         sum_exp += e;
                     }
 
                     let target_idx = target_val as usize;
 
-                    for j in 0..cols {
-                        let prob = exps[j] / sum_exp;
-                        let target = if j == target_idx { 1.0 } else { 0.0 };
-                        grad_calc[row_start + j] = (prob - target) * out_grad / (rows as f32);
+                    for i in 0..vocab_size {
+                        let prob = exps[i] / sum_exp;
+                        let target = if i == target_idx { 1.0 } else { 0.0 };
+                        grad_calc[row_start + i] = (prob - target) * out_grad / (seq_len as f32);
                     }
                 }
-
-                let is_gpu = matches!(logits_read.data, TensorData::Gpu(_));
-                let dev_clone = logits_read.device.clone();
                 drop(logits_read);
-
-                let mut p_mut = logits_node.write().unwrap();
-                if is_gpu {
-                    if p_mut.grad.is_none()
-                        && let Some((device, queue)) = dev_clone.get_gpu()
-                    {
-                        let size = (grad_calc.len() * 4) as wgpu::BufferAddress;
-                        let buf = device.create_buffer(&wgpu::BufferDescriptor {
-                            label: None,
-                            size,
-                            usage: wgpu::BufferUsages::STORAGE
-                                | wgpu::BufferUsages::COPY_DST
-                                | wgpu::BufferUsages::COPY_SRC,
-                            mapped_at_creation: false,
-                        });
-                        queue.write_buffer(&buf, 0, bytemuck::cast_slice(&grad_calc));
-                        p_mut.grad = Some(TensorData::Gpu(buf));
-                    }
-                } else {
-                    if p_mut.grad.is_none() {
-                        p_mut.grad = Some(TensorData::Cpu(grad_calc));
-                    } else {
-                        let current = match p_mut.grad.as_mut().unwrap() {
-                            TensorData::Cpu(c) => c,
-                            _ => unreachable!(),
-                        };
-                        for (c, g) in current.iter_mut().zip(grad_calc.iter()) {
-                            *c += g;
-                        }
-                    }
-                }
+                logits_node.write().unwrap().add_cpu_grad(&grad_calc);
             })),
         }))
     }
@@ -2805,41 +2889,154 @@ impl Backend for WgpuBackend {
 
     fn rope(node: &TensorNode<Self>, pos_offset: usize, head_dim: usize) -> TensorNode<Self> {
         let a = node.read().unwrap();
-        let (a_data, _) = a.to_cpu().into_raw_vec_and_offset();
-        let mut result = vec![0.0; a_data.len()];
-        let seq_len = if a.shape.len() == 3 {
-            a.shape[1]
+
+        let ndim = a.shape.len();
+        let seq_len = if ndim >= 3 {
+            a.shape[ndim - 2]
         } else {
             a.shape[0]
         };
+        let batch_size: usize = a.shape[0..ndim.saturating_sub(2)].iter().product();
         let hidden_size = *a.shape.last().unwrap();
-        let batch_size = if a.shape.len() == 3 { a.shape[0] } else { 1 };
-        let num_heads = hidden_size / head_dim;
 
-        for b in 0..batch_size {
-            let batch_offset = b * seq_len * hidden_size;
-            for pos in 0..seq_len {
-                let abs_pos = pos + pos_offset;
-                for h in 0..num_heads {
-                    let head_offset = h * head_dim;
-                    for i in (0..head_dim).step_by(2) {
-                        let idx = batch_offset + pos * hidden_size + head_offset + i;
-                        let theta = abs_pos as f32 / (10000.0f32.powf(i as f32 / head_dim as f32));
-                        let x1 = a_data[idx];
-                        let x2 = a_data[idx + 1];
-                        result[idx] = x1 * theta.cos() - x2 * theta.sin();
-                        result[idx + 1] = x1 * theta.sin() + x2 * theta.cos();
+        let out_data = match &a.data {
+            TensorData::Cpu(a_data) => {
+                let mut result = vec![0.0; a_data.len()];
+                let num_heads = hidden_size / head_dim;
+                for b in 0..batch_size {
+                    let batch_offset = b * seq_len * hidden_size;
+                    for pos in 0..seq_len {
+                        let abs_pos = pos + pos_offset;
+                        for h in 0..num_heads {
+                            let head_offset = h * head_dim;
+                            for i in (0..head_dim).step_by(2) {
+                                let idx = batch_offset + pos * hidden_size + head_offset + i;
+                                let theta =
+                                    abs_pos as f32 / (10000.0f32.powf(i as f32 / head_dim as f32));
+                                let x1 = a_data[idx];
+                                let x2 = a_data[idx + 1];
+                                result[idx] = x1 * theta.cos() - x2 * theta.sin();
+                                result[idx + 1] = x1 * theta.sin() + x2 * theta.cos();
+                            }
+                        }
                     }
                 }
+                TensorData::Cpu(result)
             }
-        }
+            TensorData::Gpu(a_buf) => {
+                if let Some((device, queue)) = a.device.get_gpu() {
+                    let total_elements = (batch_size * seq_len * hidden_size) as u32;
+                    let shader = format!(
+                        "
+                        struct Dims {{ a: u32, b: u32 }}
+                        @group(0) @binding(0) var<uniform> d: Dims;
+                        @group(0) @binding(1) var<storage, read> in_arr: array<f32>;
+                        @group(0) @binding(2) var<storage, read> ignored: array<f32>;
+                        @group(0) @binding(3) var<storage, read_write> out_arr: array<f32>;
+
+                        @compute @workgroup_size(256, 1, 1)
+                        fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
+                            let i = id.x;
+                            if (i >= d.a) {{ return; }}
+
+                            let hidden_size = d.b;
+                            let seq_idx = (i / hidden_size) % {}u;
+                            
+                            let head_dim = {}u;
+                            let pair_start = i - (i % 2u); 
+                            let head_idx = (pair_start % hidden_size) % head_dim;
+
+                            let is_even = (i % 2u) == 0u;
+                            let abs_pos = f32(seq_idx + {}u);
+
+                            let exponent = f32(head_idx) / f32(head_dim);
+                            let theta = abs_pos / pow(10000.0, exponent);
+
+                            let cos_theta = cos(theta);
+                            let sin_theta = sin(theta);
+
+                            if (is_even) {{
+                                let x1 = in_arr[i];
+                                let x2 = in_arr[i + 1u];
+                                out_arr[i] = x1 * cos_theta - x2 * sin_theta;
+                            }} else {{
+                                let x1 = in_arr[i - 1u];
+                                let x2 = in_arr[i];
+                                out_arr[i] = x1 * sin_theta + x2 * cos_theta;
+                            }}
+                        }}
+                    ",
+                        seq_len, head_dim, pos_offset
+                    );
+
+                    TensorData::Gpu(Self::wgpu_elementwise(
+                        &device,
+                        &queue,
+                        a_buf,
+                        a_buf,
+                        total_elements,
+                        hidden_size as u32,
+                        &shader,
+                    ))
+                } else {
+                    unreachable!()
+                }
+            }
+            _ => panic!("Hardware conflict"),
+        };
+
+        let pos_offset_bwd = pos_offset;
+        let head_dim_bwd = head_dim;
+
         Arc::new(RwLock::new(TensorGraph {
-            data: TensorData::Cpu(result),
+            data: out_data,
             shape: a.shape.clone(),
             grad: None,
             creators: vec![Arc::clone(node)],
-            device: EngineDevice::Cpu { cores: 1 },
-            backward: None,
+            device: a.device.clone(),
+            backward: Some(Box::new(move |out_tensor: &TensorGraph<Self>| {
+                let parent = &out_tensor.creators[0];
+                let out_grad = out_tensor.get_cpu_grad();
+                let p_read = parent.read().unwrap();
+
+                let b_ndim = p_read.shape.len();
+                let s_len = if b_ndim >= 3 {
+                    p_read.shape[b_ndim - 2]
+                } else {
+                    p_read.shape[0]
+                };
+                let b_size: usize = p_read.shape[0..b_ndim.saturating_sub(2)].iter().product();
+                let h_size = *p_read.shape.last().unwrap();
+
+                let n_heads = h_size / head_dim_bwd;
+                let mut p_grad = vec![0.0; out_grad.len()];
+
+                for b in 0..b_size {
+                    let b_off = b * s_len * h_size;
+                    for pos in 0..s_len {
+                        let abs_pos = pos + pos_offset_bwd;
+                        for h in 0..n_heads {
+                            let h_off = h * head_dim_bwd;
+                            for i in (0..head_dim_bwd).step_by(2) {
+                                let idx = b_off + pos * h_size + h_off + i;
+                                let theta = abs_pos as f32
+                                    / (10000.0f32.powf(i as f32 / head_dim_bwd as f32));
+
+                                let g1 = out_grad[idx];
+                                let g2 = out_grad[idx + 1];
+
+                                let cos_t = theta.cos();
+                                let sin_t = theta.sin();
+
+                                p_grad[idx] = g1 * cos_t + g2 * sin_t;
+                                p_grad[idx + 1] = -g1 * sin_t + g2 * cos_t;
+                            }
+                        }
+                    }
+                }
+                drop(p_read);
+                parent.write().unwrap().add_cpu_grad(&p_grad);
+            })),
         }))
     }
 

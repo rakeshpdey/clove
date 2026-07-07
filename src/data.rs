@@ -217,8 +217,7 @@ pub struct DataLoader {
     pub tokenizer: Tokenizer,
     pub seq_len: usize,
     pub batch_size: usize,
-    // PRE-FETCHING RING BUFFER: Holds batches generated asynchronously by the worker thread!
-    receiver: Receiver<(Array2<f32>, Array2<f32>)>,
+    receiver: Option<Receiver<(Array2<f32>, Array2<f32>)>>,
     worker_thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -287,7 +286,7 @@ impl DataLoader {
             tokenizer,
             seq_len,
             batch_size,
-            receiver,
+            receiver: Some(receiver),
             worker_thread: Some(worker_thread),
         }
     }
@@ -296,6 +295,8 @@ impl DataLoader {
     pub fn next_batch(&mut self) -> (Array2<f32>, Array2<f32>) {
         // INSTANT RETRIEVAL!
         self.receiver
+            .as_ref()
+            .expect("Receiver was already dropped")
             .recv()
             .expect("Failed to fetch pre-loaded batch from worker thread!")
     }
@@ -304,6 +305,7 @@ impl DataLoader {
 impl Drop for DataLoader {
     fn drop(&mut self) {
         // Wait for the background thread to safely finish its work before dropping
+        self.receiver.take();
         if let Some(thread) = self.worker_thread.take() {
             let _ = thread.join();
         }
