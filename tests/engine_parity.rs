@@ -6,8 +6,13 @@ use std::collections::HashMap;
 // --- WGPU HARDWARE HELPERS ---
 async fn init_wgpu() -> (wgpu::Device, wgpu::Queue) {
     let instance = wgpu::Instance::default();
+    let is_ci = std::env::var("CI").is_ok();
     let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions::default())
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::default(),
+            compatible_surface: None,
+            force_fallback_adapter: is_ci,
+        })
         .await
         .expect("Failed to find WebGPU adapter!");
     adapter
