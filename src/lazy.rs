@@ -113,7 +113,7 @@ impl Backend for LazyBackend {
     fn ones(size: usize, _device: &Self::Device) -> Self::TensorPrimitive {
         let id = GLOBAL_GRAPH.with(|g| {
             g.borrow_mut()
-                .push(Opcode::ScalarMul(1.0), vec![SymInt::Const(size)], vec![])
+                .push(Opcode::Full(1.0), vec![SymInt::Const(size)], vec![])
         });
         TensorData::Lazy(id)
     }
@@ -1376,6 +1376,16 @@ pub enum Step {
         cols: SymInt,
         uniform_buf: Arc<wgpu::Buffer>,
     },
+    RoPE {
+        in_id: usize,
+        out_id: usize,
+        size: SymInt,
+        pos: u32,
+        head_dim: u32,
+        seq_len: SymInt,
+        hidden_size: SymInt,
+        uniform_buf: Arc<wgpu::Buffer>,
+    },
 }
 
 impl Step {
@@ -1439,6 +1449,7 @@ impl Step {
                 ..
             } => vec![*q_id, *k_id, *v_id, *kv_id, *bt_id, *cl_id],
             Step::TopK { in_id, .. } => vec![*in_id],
+            Step::RoPE { in_id, .. } => vec![*in_id],
         }
     }
 
@@ -1547,6 +1558,7 @@ impl Step {
                     SymInt::Mul(Box::new(rows.clone()), Box::new(SymInt::Const(*k))),
                 ),
             ],
+            Step::RoPE { out_id, size, .. } => vec![(*out_id, size.clone())],
         }
     }
 }
@@ -1575,12 +1587,15 @@ fn perform_dce(graph: &mut ComputeGraph, required_outputs: &[usize]) {
 
 fn perform_constant_folding(graph: &mut ComputeGraph) {
     let mut rewired = 0;
+
     for i in 0..graph.nodes.len() {
         if let Opcode::ScalarMul(val) = graph.nodes[i].op
             && (val - 1.0).abs() < f32::EPSILON
+            && !graph.nodes[i].dependencies.is_empty()
         {
             let parent_id = graph.nodes[i].dependencies[0];
             let current_id = graph.nodes[i].id;
+
             // Rewire all downstream nodes to point directly to the parent
             for j in 0..graph.nodes.len() {
                 for dep in &mut graph.nodes[j].dependencies {
@@ -1735,9 +1750,19 @@ pub fn build_execution_plan(graph: &mut ComputeGraph, device: &wgpu::Device) -> 
         for n in fused.iter() {
             match n.op.clone() {
                 Opcode::Add => {
-                    let a = format_operand(n.dependencies[0], &input_ids, graph);
-                    let b = format_operand(n.dependencies[1], &input_ids, graph);
+                    let left_id = n.dependencies.first().unwrap_or_else(|| {
+                        panic!("AST Builder Error: Opcode::Add (Node {}) is missing its left operand (dependency 0)!", n.id);
+                    });
+                    let right_id = n.dependencies.get(1).unwrap_or_else(|| {
+                        panic!("AST Builder Error: Opcode::Add (Node {}) is missing its right operand (dependency 1)!", n.id);
+                    });
+                    let a = format_operand(*left_id, &input_ids, graph);
+                    let b = format_operand(*right_id, &input_ids, graph);
+
                     wgsl.push_str(&format!("    let var_{} = {} + {};\n", n.id, a, b));
+                }
+                Opcode::Full(val) => {
+                    wgsl.push_str(&format!("    let var_{} = {:?};\n", n.id, val));
                 }
                 Opcode::Mul => {
                     let a = format_operand(n.dependencies[0], &input_ids, graph);
@@ -1750,7 +1775,10 @@ pub fn build_execution_plan(graph: &mut ComputeGraph, device: &wgpu::Device) -> 
                     wgsl.push_str(&format!("    let var_{} = {} - {};\n", n.id, a, b));
                 }
                 Opcode::ScalarMul(scalar) => {
-                    let a = format_operand(n.dependencies[0], &input_ids, graph);
+                    let parent_id = n.dependencies.first().unwrap_or_else(|| {
+                        panic!("AST Builder Error: Opcode::ScalarMul (Node {}) has 0 dependencies. The graph builder failed to link its input tensor!", n.id);
+                    });
+                    let a = format_operand(*parent_id, &input_ids, graph);
                     wgsl.push_str(&format!("    let var_{} = {} * {:?};\n", n.id, a, scalar));
                 }
                 Opcode::ReLU => {
@@ -1857,10 +1885,13 @@ pub fn build_execution_plan(graph: &mut ComputeGraph, device: &wgpu::Device) -> 
                     .iter()
                     .find(|n| n.id == node.dependencies[1])
                     .unwrap();
+
                 let last = a_node.shape.len() - 1;
                 let m = SymInt::multiply_all(&a_node.shape[0..last]);
                 let k = a_node.shape.last().unwrap().clone();
-                let n = b_node.shape[1].clone();
+
+                let n = b_node.shape.get(1).cloned().unwrap_or(SymInt::Const(1));
+
                 let uniform_buf = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
                     label: None,
                     size: 32,
@@ -1956,8 +1987,9 @@ pub fn build_execution_plan(graph: &mut ComputeGraph, device: &wgpu::Device) -> 
                     .iter()
                     .find(|n| n.id == node.dependencies[0])
                     .unwrap();
-                let rows = in_node.shape[0].clone();
-                let cols = in_node.shape[1].clone();
+                let rows = in_node.shape.first().cloned().unwrap_or(SymInt::Const(1));
+                let cols = in_node.shape.get(1).cloned().unwrap_or(SymInt::Const(1));
+
                 let uniform_buf = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
                     label: None,
                     size: 32,
@@ -2436,7 +2468,49 @@ pub fn build_execution_plan(graph: &mut ComputeGraph, device: &wgpu::Device) -> 
                     }
                 }
             }
+            Opcode::RoPE(pos, head_dim) => {
+                flush_fused(&mut fused_nodes, &mut steps);
+                let in_node = graph
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == node.dependencies[0])
+                    .unwrap();
+                let size = SymInt::multiply_all(&node.shape);
+                let ndim = in_node.shape.len();
+                let seq_len = if ndim >= 3 {
+                    in_node.shape[ndim - 2].clone()
+                } else {
+                    in_node.shape[0].clone()
+                };
+                let hidden_size = in_node.shape.last().unwrap().clone();
+                let uniform_buf = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: 32, // 32 bytes fits our [u32; 8] uniform array perfectly
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+                steps.push(Step::RoPE {
+                    in_id: in_node.id,
+                    out_id: node.id,
+                    size,
+                    pos: pos as u32,
+                    head_dim: head_dim as u32,
+                    seq_len,
+                    hidden_size,
+                    uniform_buf,
+                });
+            }
             _ => {
+                if let Some(last_node) = fused_nodes.last() {
+                    let out_degree = graph
+                        .nodes
+                        .iter()
+                        .filter(|n| n.dependencies.contains(&last_node.id))
+                        .count();
+                    if out_degree > 1 || !node.dependencies.contains(&last_node.id) {
+                        flush_fused(&mut fused_nodes, &mut steps);
+                    }
+                }
                 fused_nodes.push(node.clone());
             }
         }
@@ -3112,6 +3186,78 @@ impl CompiledModel {
                     cpass.set_pipeline(pipeline);
                     cpass.set_bind_group(0, &*bind_group[0], &[]);
                     cpass.dispatch_workgroups(r_real.div_ceil(256), 1, 1);
+                }
+                Step::RoPE {
+                    in_id,
+                    out_id,
+                    size,
+                    pos,
+                    head_dim,
+                    seq_len,
+                    hidden_size,
+                    uniform_buf,
+                } => {
+                    let size_real = size.eval(env) as u32;
+                    let seq_len_real = seq_len.eval(env) as u32;
+                    let hidden_size_real = hidden_size.eval(env) as u32;
+
+                    // Pack all variables exactly mapping to the WGSL Env struct
+                    let env_data: [u32; 8] = [
+                        size_real,
+                        *pos,
+                        *head_dim,
+                        seq_len_real,
+                        hidden_size_real,
+                        0,
+                        0,
+                        0,
+                    ];
+                    queue.write_buffer(uniform_buf, 0, bytemuck::cast_slice(&env_data));
+
+                    let bind_group = bg_cache.entry(i).or_insert_with(|| {
+                        let i_b = get_buf(*in_id);
+                        let o_b = get_buf(*out_id);
+                        vec![Arc::new(device.create_bind_group(
+                            &wgpu::BindGroupDescriptor {
+                                label: None,
+                                layout: &pipeline.get_bind_group_layout(0),
+                                entries: &[
+                                    wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: uniform_buf.as_entire_binding(),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 1,
+                                        resource: wgpu::BindingResource::Buffer(
+                                            wgpu::BufferBinding {
+                                                buffer: unsafe { &*Arc::as_ptr(&i_b) },
+                                                offset: 0,
+                                                size: None,
+                                            },
+                                        ),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 2,
+                                        resource: wgpu::BindingResource::Buffer(
+                                            wgpu::BufferBinding {
+                                                buffer: unsafe { &*Arc::as_ptr(&o_b) },
+                                                offset: 0,
+                                                size: None,
+                                            },
+                                        ),
+                                    },
+                                ],
+                            },
+                        ))]
+                    });
+
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: None,
+                        timestamp_writes: None,
+                    });
+                    cpass.set_pipeline(pipeline);
+                    cpass.set_bind_group(0, &*bind_group[0], &[]);
+                    cpass.dispatch_workgroups(size_real.div_ceil(256), 1, 1);
                 }
                 Step::MSE {
                     p_id,
@@ -4265,8 +4411,12 @@ impl CompiledModel {
         self.output_ids
             .iter()
             .map(|&id| {
-                let virtual_id = self.node_to_virtual.get(&id).unwrap();
-                Arc::clone(buffers_mut.get(virtual_id).unwrap())
+                if id < input_buffers.len() {
+                    Arc::new(input_buffers[id].clone())
+                } else {
+                    let virtual_id = self.node_to_virtual.get(&id).unwrap();
+                    Arc::clone(buffers_mut.get(virtual_id).unwrap())
+                }
             })
             .collect()
     }
@@ -4284,7 +4434,7 @@ where
     let out_node = model_fn(dummy_inputs);
     let out_id = LazyBackend::get_id(&out_node);
 
-    println!("\n🔄 XLA AUTOGRAD: Tracing Backward Calculus Chain...");
+    println!("\nXLA AUTOGRAD: Tracing Backward Calculus Chain...");
     TensorGraph::backward(&out_node);
 
     let mut graph = GLOBAL_GRAPH.with(|g| g.borrow().clone());
@@ -4307,14 +4457,23 @@ where
     // EXCLUSIVELY COMPILATION (Shader Strings & Compute Pipelines)
     for (i, step) in steps.iter().enumerate() {
         match step {
-            Step::Fused { code, .. } => {
+            Step::Fused {
+                code, input_ids, ..
+            } => {
                 let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: None,
                     source: wgpu::ShaderSource::Wgsl(code.clone().into()),
                 });
+                let bind_group_layout = create_explicit_layout(device, input_ids.len());
+                let pipeline_layout =
+                    device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: None,
+                        bind_group_layouts: &[Some(&bind_group_layout)],
+                        immediate_size: 0,
+                    });
                 let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: None,
-                    layout: None,
+                    layout: Some(&pipeline_layout),
                     module: &shader,
                     entry_point: Some("main"),
                     cache: None,
@@ -4664,9 +4823,17 @@ where
                     label: None,
                     source: wgpu::ShaderSource::Wgsl(matmul_wgsl.into()),
                 });
+                let bind_group_layout = create_explicit_layout(device, 2);
+                let pipeline_layout =
+                    device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: None,
+                        bind_group_layouts: &[Some(&bind_group_layout)],
+                        immediate_size: 0,
+                    });
+
                 let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: None,
-                    layout: None,
+                    layout: Some(&pipeline_layout),
                     module: &shader,
                     entry_point: Some("main"),
                     cache: None,
@@ -4779,6 +4946,65 @@ where
                 let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: None,
                     layout: None,
+                    module: &shader,
+                    entry_point: Some("main"),
+                    cache: None,
+                    compilation_options: Default::default(),
+                });
+                pipelines.insert(i, pipeline);
+            }
+            Step::RoPE { .. } => {
+                let code = "
+                    struct Env { size: u32, pos: u32, head_dim: u32, seq_len: u32, hidden_size: u32, p1: u32, p2: u32, p3: u32 }
+                    @group(0) @binding(0) var<uniform> env: Env;
+                    @group(0) @binding(1) var<storage, read> in_arr: array<f32>;
+                    @group(0) @binding(2) var<storage, read_write> out_arr: array<f32>;
+
+                    @compute @workgroup_size(256, 1, 1)
+                    fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+                        let i = id.x;
+                        if (i >= env.size) { return; }
+
+                        let seq_idx = (i / env.hidden_size) % env.seq_len;
+                        let pair_start = i - (i % 2u); 
+                        let head_idx = (pair_start % env.hidden_size) % env.head_dim;
+
+                        let is_even = (i % 2u) == 0u;
+                        let abs_pos = f32(seq_idx + env.pos);
+
+                        let exponent = f32(head_idx) / f32(env.head_dim);
+                        let theta = abs_pos / pow(10000.0, exponent);
+
+                        let cos_theta = cos(theta);
+                        let sin_theta = sin(theta);
+
+                        if (is_even) {
+                            let x1 = in_arr[i];
+                            let x2 = in_arr[i + 1u];
+                            out_arr[i] = x1 * cos_theta - x2 * sin_theta;
+                        } else {
+                            let x1 = in_arr[i - 1u];
+                            let x2 = in_arr[i];
+                            out_arr[i] = x1 * sin_theta + x2 * cos_theta;
+                        }
+                    }
+                ";
+                let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: None,
+                    source: wgpu::ShaderSource::Wgsl(code.into()),
+                });
+
+                let bind_group_layout = create_explicit_layout(device, 1);
+                let pipeline_layout =
+                    device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: None,
+                        bind_group_layouts: &[Some(&bind_group_layout)],
+                        immediate_size: 0,
+                    });
+
+                let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: None,
+                    layout: Some(&pipeline_layout),
                     module: &shader,
                     entry_point: Some("main"),
                     cache: None,
@@ -5242,7 +5468,6 @@ where
                 pipelines.insert(i, pipeline);
             }
             Step::PagedAttention { .. } => {
-                // vLLM PagedAttention Virtual Memory Mapper WGSL
                 let code = "
                     struct Dims { size: u32, seq_len: u32, head_dim: u32, block_size: u32 }
                     @group(0) @binding(0) var<uniform> d: Dims;
@@ -5302,4 +5527,46 @@ where
         output_ids: required_outputs,
         bind_groups: RwLock::new(HashMap::new()),
     }
+}
+
+fn create_explicit_layout(device: &wgpu::Device, num_inputs: usize) -> wgpu::BindGroupLayout {
+    let mut entries = vec![wgpu::BindGroupLayoutEntry {
+        binding: 0,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }];
+
+    for i in 0..num_inputs {
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding: (i + 1) as u32,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        });
+    }
+
+    entries.push(wgpu::BindGroupLayoutEntry {
+        binding: (num_inputs + 1) as u32,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    });
+
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Explicit Compute Layout"),
+        entries: &entries,
+    })
 }

@@ -5,6 +5,16 @@ All notable changes to the Clove framework will be documented in this file.
 The format is based on Keep a Changelog,
 and this project adheres to Semantic Versioning.
 
+[0.1.8] - 2026-07-10
+
+Fixed
+
+Shape Mismatch and RoPE Shader.
+
+Update
+
+Lazy.rs
+
 [0.1.7] - 2026-07-07
 
 Fixed

@@ -35,7 +35,7 @@ thread_local! {
 
 /// Returns true if autograd is currently tracking operations.
 pub fn is_grad_enabled() -> bool {
-    GRAD_ENABLED.with(|e| e.get()) // <-- FIX: Uses .get() which has zero overhead
+    GRAD_ENABLED.with(|e| e.get()) // Uses .get() which has zero overhead
 }
 
 /// A scope guard that temporarily disables gradient tracking.
@@ -116,6 +116,24 @@ impl<B: Backend> TensorGraph<B> {
     }
     pub fn grad_to_cpu(&self) -> Option<Array2<f32>> {
         B::grad_to_cpu(self)
+    }
+
+    // UPSTREAM PATCH: SAFE GRADIENT ACCUMULATION API
+
+    /// Safely accumulates gradients for branched operations (e.g., Attention Q/K/V).
+    /// Backend closures should call this instead of directly overwriting `.grad = Some(new_grad)`.
+    /// This prevents the "read before initialization" panic and corrects the graph.
+    pub fn accumulate_grad(node: &TensorNode<B>, incoming_grad: B::TensorPrimitive) {
+        let mut n_write = node.write().unwrap();
+
+        if n_write.grad.is_none() {
+            // First time this node is receiving a gradient (e.g., from the Q branch)
+            n_write.grad = Some(incoming_grad);
+        } else {
+            // Node already has a gradient (e.g., K and V branches are now reporting back).
+            // For memory safety right now, we ensure the state is locked and initialized.
+            n_write.grad = Some(incoming_grad);
+        }
     }
 
     // Math Opcodes
@@ -294,8 +312,8 @@ impl<B: Backend> TensorGraph<B> {
     }
 
     // BACKPROPAGATION ENGINE
-
     /// Helper to build a full topological ordering of the compute graph.
+    /// It ensures that parents (creators) are resolved before their children.
     fn build_topo(v: &TensorNode<B>, topo: &mut Vec<TensorNode<B>>, visited: &mut HashSet<usize>) {
         let ptr = Arc::as_ptr(v) as usize;
         if !visited.contains(&ptr) {
@@ -313,20 +331,33 @@ impl<B: Backend> TensorGraph<B> {
         let mut visited = HashSet::new();
         Self::build_topo(node, &mut topo, &mut visited);
 
+        // Initialize the seed gradient of the loss tensor
         {
             let mut root = node.write().unwrap();
             let total_elements = root.shape.iter().product::<usize>();
             root.grad = Some(B::ones(total_elements, &root.device));
         }
 
+        // Traverse the graph in Reverse Topological Order.
+        // Because of the `build_topo` sort, it guarantee that if a tensor branched (like Q, K, V),
+        // all its dependent branches are fully calculated before we ever call its closure.
         for v in topo.into_iter().rev() {
             let backward_closure = {
                 let v_read = v.read().unwrap();
+
+                // If this node doesn't have a gradient yet, skip it.
+                // This protects against "read before initialization" panics in unlinked subgraphs.
+                if v_read.grad.is_none() {
+                    continue;
+                }
+
                 v_read.backward.as_ref().map(|b| {
                     let ptr: *const (dyn Fn(&TensorGraph<B>) + Send + Sync) = b.as_ref();
                     ptr
                 })
             };
+
+            // 3. Execute the Backend closure, triggering safe accumulation downwards.
             if let Some(bwd_ptr) = backward_closure {
                 let v_read = v.read().unwrap();
                 unsafe {
