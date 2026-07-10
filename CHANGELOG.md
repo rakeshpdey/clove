@@ -9,6 +9,12 @@ and this project adheres to Semantic Versioning.
 
 Fixed
 
+Fix CI parity test failures
+
+[0.1.8] - 2026-07-10
+
+Fixed
+
 Shape Mismatch and RoPE Shader.
 
 Update

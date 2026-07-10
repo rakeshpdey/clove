@@ -1,6 +1,6 @@
 [package]
 name = "clove"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 description = "A hardware-agnostic Machine Learning and Deep Learning framework featuring a native C-ABI."
 license = "MIT"
