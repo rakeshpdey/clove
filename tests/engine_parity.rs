@@ -393,7 +393,7 @@ fn test_scalar_mul_parity() {
     pollster::block_on(async {
         let (device, queue) = init_wgpu().await;
         let arr_a = generate_random_array(16, 16);
-        let scalar = 3.14159f32;
+        let scalar = std::f32::consts::PI;
 
         let eager_a = WgpuBackend::new(arr_a.clone());
         let eager_out = WgpuBackend::mul_scalar(&eager_a, scalar);
